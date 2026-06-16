@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ SUBMISSION_CODE_PATH = REPO_ROOT / "miner" / "agent.py"
 logger = get_logger()
 CLAUDE_MODEL = "claude-opus-4-6"
 CLAUDE_TIMEOUT_SECONDS = 15 * 60
+CLAUDE_READY_TIMEOUT_SECONDS = 45
 
 PROJECT_KEYS = [
     "code4rena_superposition_2025_01",
@@ -101,13 +103,13 @@ def check_claude_ready() -> bool:
             check=False,
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=CLAUDE_READY_TIMEOUT_SECONDS,
         )
     except (FileNotFoundError, OSError) as exc:
         logger.error("Claude readiness check failed: %s", exc)
         return False
     except subprocess.TimeoutExpired:
-        logger.error("Claude readiness check timed out after 20s")
+        logger.error("Claude readiness check timed out after %ss", CLAUDE_READY_TIMEOUT_SECONDS)
         return False
 
     combined = f"{result.stdout}\n{result.stderr}".lower()
@@ -179,6 +181,8 @@ def run_assessment(prompt: str, json_schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
+    submission_code_path = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else SUBMISSION_CODE_PATH
+
     if not check_claude_ready():
         return 1
 
@@ -198,9 +202,9 @@ def main() -> int:
         )
 
     try:
-        submission_code = SUBMISSION_CODE_PATH.read_text(encoding="utf-8")
+        submission_code = submission_code_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise SystemExit(f"Submission code file not found: {SUBMISSION_CODE_PATH}") from exc
+        raise SystemExit(f"Submission code file not found: {submission_code_path}") from exc
 
     try:
         prompt_template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -220,9 +224,10 @@ def main() -> int:
         logger.info("Rendered prompt written to: %s", RENDERED_PROMPT_OUT)
 
     logger.info(
-        "Matched %s project(s) for %s requested key(s).",
+        "Matched %s project(s) for %s requested key(s) against %s.",
         len(filtered_entries),
         len(keys),
+        submission_code_path,
     )
 
     assessment_response = run_assessment(

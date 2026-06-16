@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     app_env: str | None = "development"
     local: bool = False
     wallet_name: str | None = None
+    hotkey_name: str = "default"
 
     chutes_api_key: str | None
     inference_api_key: str | None = None

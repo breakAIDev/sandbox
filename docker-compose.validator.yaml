@@ -19,4 +19,5 @@ services:
         --netuid ${NETUID}
         --subtensor.network ${NETWORK}
         --wallet.name ${WALLET_NAME}
+        --wallet.hotkey ${HOTKEY_NAME}
         --logging.info

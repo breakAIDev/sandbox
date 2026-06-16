@@ -57,7 +57,7 @@ class APIPlatformClient:
 
     def set_wallet(self, wallet_name: str | None = None):
         wallet_name = wallet_name or settings.wallet_name
-        wallet = Wallet(wallet_name)
+        wallet = Wallet(wallet_name, hotkey=settings.hotkey_name)
         self.hotkey = wallet.hotkey
 
     def _create_wallet_token(self, hotkey: str, expiry_minutes: int = 1) -> str:

@@ -118,7 +118,10 @@ def miner_run_no_docker():
 def miner_execute_agent():
     """Run the miner agent script locally on a single project."""
     cmd = [sys.executable, "miner/agent.py"]
-    subprocess.run(cmd, env=os.environ.copy(), check=True)
+    env = os.environ.copy()
+    root = str(Path(__file__).parent.resolve())
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    subprocess.run(cmd, env=env, check=True)
 
 # -------------------------------------------------------
 # Validator commands
