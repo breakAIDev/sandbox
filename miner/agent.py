@@ -88,10 +88,10 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
     11. External call lifecycle: unchecked low-level call return, stale allowances.
     12. Upgradeable proxy: storage slot collision, missing _disableInitializers(), re-callable initialize, selector clash, __gap undersizing.
     13. Cross-call coupling: helper/caller unit divergence, sentinel return value not branched, tracker not written back.
-    14. State-transfer completeness: when an accounting record changes ownership, verify per-holder history fields are reset or recomputed for the new holder rather than carried over.
-    15. Initialization correctness: verify constructors/initializers set the intended owner, beneficiary, and baseline values, and reject uninitialized (zero) states in any guard that gates access.
-    16. Beneficiary-change ordering: verify pending balances are checkpointed before any change to who receives funds or yield.
-    17. Function-replacement parity: when one function supersedes another, verify the replacement preserves all safety parameters (slippage bounds, deadlines, per-path validation) from the original.
+    14. State-transfer completeness: when a position/vesting/stake record changes holder, history fields encoding the prior holder's progress (claimed-step counter, reward debt, claim index, release rate derived from the original grant) must be reset or recomputed — carried-over history lets the new holder unlock early or accrue at the wrong rate.
+    15. Initialization correctness: a factory that sets owner=address(this) (or any placeholder) on a child makes the child's owner-only functions permanently uncallable; an onboarding helper that seeds a score/rank/index at its maximum grants unearned rewards from block one; a time guard comparing block.timestamp to a stored deadline passes immediately when that deadline is still zero. Verify intended owner/beneficiary/baseline are set and zero states are rejected.
+    16. Beneficiary-change ordering: a function that changes who receives yield must checkpoint and credit the current beneficiary's pending rewards BEFORE updating the recipient mapping; updating first hands the prior holder's earned yield to the new recipient.
+    17. Function-replacement parity: when one function supersedes/merges deprecated ones, a dropped slippage-min, deadline, or per-path validation on one merged path silently removes user protection there — verify the replacement preserves ALL safety parameters from each original.
 
     RULES:
     - Read the target file first (already provided). Use at most 2 additional tool calls to read related files.
@@ -238,21 +238,32 @@ In this pass, prioritise scrutiny of how the contract returns or refunds value t
 
 For any function that both takes assets in and sends assets back out in the
 same call, trace what each transfer's amount actually represents — not what
-the variable is named. Confirm that inbound and outbound amounts, together
-with any refund or change returned, conserve value: the contract should never
-hand back more than it took, and should not retain value it was meant to
-return. Verify each amount against its assignment site, distinguishing a
-requested quantity from a quantity that a downstream step actually consumed,
-and confirm any reconciliation references the correct one.
+the variable is named. A particular failure shape: the pull side is sized to
+what will actually be used, while a second transfer back to the caller re-uses
+the originally-requested input to size its amount — so the second transfer
+hands back funds the first transfer never took. The dual shape — taking a
+stated amount in full but consuming only part and never returning the rest —
+is equally worth flagging.
 
-Apply the same value-conservation scrutiny to multi-step routing or aggregator
-helpers that attempt one or more downstream venues and then return unused
-input: the final refund must reconcile against the total actually consumed
-across all steps, not against a single step's figure.
+Treat this as a checklist for any function with both an inbound and an
+outbound transfer to the same counterparty in the same call: write down the
+variable feeding the first transfer's amount and the variable feeding the
+second, and decide whether their algebraic relationship matches what the
+function is supposed to do. A refund or change-return whose amount is derived
+from the requested figure rather than from what the inbound transfer actually
+moved is a refund overpayment.
 
-For contracts in any EVM-family language (Solidity, Rust/Stylus, Vyper),
-apply this reasoning regardless of variable naming conventions — trace each
-value to its source rather than trusting its name.
+This shape hides in multi-step routing / aggregator helpers that attempt one
+or more downstream venues and then return unused input: each attempt has its
+own "tried" amount and "actually executed" amount, and the final refund must
+be the request minus the SUM of all actually-executed amounts, never the
+request minus a single attempt's tried figure. A refund formula that
+references only one step's input pays back every other step's unconsumed
+delta as if the caller had funded it.
+
+Trace each value to its assignment site — a value taken from a function
+parameter is a requested amount; a value taken from a swap/transfer return is
+an actually-consumed amount — and apply this regardless of language or naming.
 
 Report concrete, proven cases with numerical evidence.
 </primary_targets>
@@ -289,11 +300,17 @@ on the approved address can move funds from the granting contract. If any
 of those reachable functions accept a caller-supplied source, that's a
 drain primitive on the granting contract's balance.
 
-Pay particular attention to any approval granted for more than the amount the
-downstream step will actually spend. Any unspent portion that remains live
-after the call returns is a residual spending right on the granting contract's
-balance. Verify every approval path is followed either by a full spend or by
-an explicit reset on every exit branch.
+Pay particular attention to dispatcher / router contracts that set a maximum
+(unlimited) approval on a downstream contract before delegating work to it.
+Because a max approval is cheaper than an exact-amount approval, protocols
+often use it as a one-shot setup step assuming the downstream will spend
+exactly the required amount. But any unspent portion of that approval remains
+live after the call returns and is never reset, creating a permanent drain
+primitive — even when the contract otherwise refunds unspent input to the
+caller. Verify every approval path (max or exact) is followed either by a full
+spend or by an explicit reset to zero on BOTH the success branch and every
+early-return / error branch; a single branch that skips the reset leaves a
+residual spending right the grantee can exercise later.
 
 Report concrete, proven cases with numerical evidence.
 </primary_targets>
@@ -378,19 +395,28 @@ beneficiary, trace every payout, claim, and unstake path that touches
 those funds and verify each path consults the link before deciding the
 destination.
 
-When a loop caches a value to avoid re-fetching on every iteration, verify
-that EVERY state variable updated in the non-cached path is also kept current
-in the cached path, and that any variable used as a comparison key is itself
-reassigned inside the loop body. A cache or tracking variable that is read but
-never updated leaves later iterations operating on stale or uninitialized data
-— including a default zero value that can route funds or state to an
-unintended destination.
+When a loop caches a value to avoid re-fetching on every iteration — e.g. it
+skips a storage read when the current item's key equals the previous item's
+key — verify two things. First, EVERY state variable written in the
+first-encounter (non-cached) path is also written in the cached path; a
+cache-hit branch that advances a primary counter but skips a secondary write
+silently leaves that secondary variable pointing at the previous item's data
+for all later cached iterations. Second, the tracking key the skip condition
+compares against is reassigned at the end of every iteration; a tracker that
+is never updated stays at its initialization value (commonly 0 / the zero
+address), so the skip either never fires, or fires on the very first item when
+the input matches that sentinel — dispatching funds or state through the
+still-uninitialized variable to the zero address. Walk every storage write in
+the loop body and confirm the tracker is among them.
 
-When a record's baseline is initialized from the current value of a running
-total or accumulator, verify the baseline semantics are correct. Seeding a new
-record's baseline from a global running total rather than from zero gives the
-record a head-start equal to all prior activity, distorting any formula that
-later computes its share as (current_total - baseline).
+When a record's baseline is initialized by copying the current value of a
+global, ever-growing running total or counter, verify the baseline semantics.
+Seeding a new record's score or reward baseline from the CURRENT global total
+rather than from zero gives that record a head-start equal to all prior
+activity: any later formula that computes the record's earned share as
+(current_total − baseline) under-reports for old records and over-reports for
+newly created ones, because the baseline was the accumulated total at creation
+time, not zero.
 
 Report concrete, proven cases with numerical evidence.
 </primary_targets>
@@ -406,7 +432,7 @@ _SYSTEM_A_COMMON_TAIL = """
 </methodology>
 
 <do_not_report>
-- First-depositor inflation attacks when minimum share checks exist
+- First-depositor inflation / share-price-rounding attacks ONLY when the contract already has a guard (minimum initial shares, dead-shares burned to address(0) at first deposit, or a virtual-offset). When NO such guard exists and the first depositor can inflate the share price by donating assets so that a later depositor's deposit rounds to zero shares, that IS reportable.
 - Reentrancy when nonReentrant modifier is present on the function
 - Generic "missing input validation" without a concrete exploit showing fund loss
 - Centralization risks that are intentional design (onlyOwner, timelock governance)
@@ -527,16 +553,16 @@ Pay extra attention to any entry-point where the caller's identity is not trivia
 Look for access-control and authorization bugs: places where the wrong party can make the contract do something on someone else's behalf.
 For every external entry-point determine the correct caller and verify the contract enforces it; for every signature-gated entry-point check whether the submitter is bound by the signed digest, not only the signer.
 For any state-mutating entry-point operating on stored entities that have a lifecycle status, verify the function actually consults the current status before mutating, otherwise the entity can be manipulated after it should be considered finalized. This includes verifying that a record is only created once any precondition it depends on (e.g. a governance outcome) has actually been reached, not merely that the caller is authorized to request it.
-Pay special attention to state-mutating helpers that bring new participants into a privileged collection — in particular helpers whose names suggest registration or onboarding (add*, register*, init*, set*, grant*) — verify each enforces the access control its surrounding contract relies on, and that any initial state it records is within the realistic range the protocol later assumes. Initial state seeded outside that range can yield unearned downstream benefits the moment the entity is registered.
+Pay special attention to state-mutating helpers that bring new participants into a privileged collection — in particular helpers whose names suggest registration or onboarding (add*, register*, init*, set*, grant*, score*) — verify each enforces the access control its surrounding contract relies on; an unguarded onboarding helper lets an attacker self-register or take over a position with trivial inputs. When such a helper records the new entrant's initial state, check each recorded value against what the protocol later reads it as: a helper that defaults a score, weight, rank, or accrual index to the maximum (or to the current global total) lets the new entity claim full rewards or top priority from its first block.
 When a gated entry-point lets the caller specify values that flow downstream into another contract which then treats them as authoritative, trace each caller-supplied field through every downstream consumer; verifying the caller's identity does not validate the values they supply, and a downstream contract may trust those values without re-checking them.
 For helpers that forward execution to a (target, calldata) supplied by the caller, check whether target is whitelisted / restricted; an unrestricted indirection lets the caller drain any allowance the protocol holds on its behalf.
-For entry-points that accept a source/owner/receiver field naming an account other than the caller, verify the named account authorized this specific operation. Executing a movement or configuration on behalf of an unrelated account using only a pre-existing allowance or no authorization at all lets any caller act for any account — including steering delegation, voting power, or attribution for accounts that never consented.
+For entry-points that accept a source/owner/receiver field naming an account other than the caller, verify the named account authorized this specific operation. Executing a movement or configuration on behalf of an unrelated account using only a pre-existing allowance or no authorization at all lets any caller act for any account. The high-severity shape: a function takes a (receiver, delegatee-or-config) pair and lets the caller set both, then calls a delegation hook that OVERWRITES the receiver's entire existing delegation rather than just the newly-added portion — an attacker can register a dust-sized position naming any victim as receiver and seize that victim's full existing voting power or yield attribution in a single transaction worth orders of magnitude more.
 Setters and updaters of permission-bearing storage need access control on every callable entry — a single ungated entry to such storage admits an attacker into the trust circle.
 In any function that decides who receives funds, the destination should be derived from on-chain permission records rather than from runtime properties of the caller.
 For privileged setters that tune economic constants — risk ratios, fee components, time windows, scaling denominators — confirm each new value is clamped to a range within which the protocol still operates safely; the trust assumption documented for the role does not eliminate the finding when no bounds are enforced in code.
 Check any use of `tx.origin` for authentication: contracts that compare `tx.origin == owner` or use `tx.origin` as the authorization subject instead of `msg.sender` allow any contract in the call chain to impersonate the original EOA.
 For factory or deployer contracts that create child contracts: verify the intended owner/admin/beneficiary is passed at construction, not a protocol-controlled placeholder address that would leave the child's privileged functions permanently inaccessible. Trace the ownership argument of every constructor or initializer call in a deployment flow and confirm who controls the child after deployment.
-For reward or yield distribution functions that use a role condition to skip a protection check, verify the exemption truly applies to that role and does not let a privileged caller bypass checks that exist to protect third-party beneficiaries (delegators, stakers, depositors). A role check should gate who can initiate an action, not whether beneficiary protections are enforced.
+For reward or yield distribution functions that use a role condition to SKIP a beneficiary-protection check (a guard of the shape "if caller is not the privileged role, require the beneficiary mapping/authorization to be set"), verify the exemption truly applies to that role and was not a mistake that lets the privileged caller claim rewards or exercise state on behalf of third-party beneficiaries (delegators, stakers, depositors) who never authorized it. A role check should gate who can INITIATE an action, not whether the beneficiary protections themselves are enforced.
 For every signature-verified entry-point, audit the EIP-712 domain separator for completeness: (a) `chainId` absent or hardcoded — same signed message replays on a fork or another chain where the contract is deployed at the same address; (b) `verifyingContract` absent or wrong — signatures intended for one contract in the protocol are replayable on a sibling contract that shares the signer; (c) per-user nonce absent or never incremented — signed operations replayable indefinitely; (d) deadline / expiry field absent — signed operations valid forever with no revocation path; (e) `ecrecover` return value not checked for `address(0)` — an all-zero signature produces a zero recovered address, and contracts that do not reject `recovered == address(0)` accept a forged signature for any address.
 For `CREATE2`-based factories, verify: the salt is not derivable purely from public inputs (caller, token pair, nonce) that an attacker can compute off-chain; the factory checks that the deployed bytecode matches the expected initcode hash after deployment; and a third-party call to the same `CREATE2` address before the factory deploys does not silently redirect the factory's subsequent writes to an attacker-controlled contract.
 Report concrete exploit sequences with direct economic impact.
@@ -774,7 +800,7 @@ Identify the contract's role and apply the math/iteration scrutiny appropriate t
 Look for math, precision, iteration and type-casting bugs.
 For every exposed math primitive (sqrt, log, exp, division, modulo, equality helpers) explicitly walk through what happens when the input is zero, negative, one, or max-uint — does the function return a meaningful value, revert with a clear domain error, or silently halt the control flow?
 Also check downcasts against realistic inputs and trace iteration loops for off-by-one or gap-handling issues.
-When a loop reuses a cached lookup across consecutive iterations, the cache only stays consistent if both the cached value AND the tracking variable that gates the refresh are updated together. If the tracking variable is never reassigned inside the loop body, later iterations operate on stale or default data while still consuming it — which can route an operation to the wrong target. Walk every storage write inside the loop body and confirm the tracker is among them; absence is a finding.
+When a loop reuses a cached lookup across consecutive iterations, the cache only stays consistent if both the cached value AND the tracking key that gates the refresh are updated together. A specific shape: the loop processes a batch where each item carries a key, and inside the loop it reads a per-key derived value (an address, a balance, a config field) by comparing the current item's key against a tracking variable and only refreshing the derived value on a mismatch. If that tracking variable is NEVER reassigned in the loop body, the first iteration computes the derived value once and the comparison stays "different" forever — so either the value is recomputed every iteration (harmless), OR it is captured into a function-scope alias that keeps the FIRST item's value while the per-iteration operation ships to the wrong target, including the zero address when the tracker's initial value happens to equal the first item's key. Walk every storage write inside the loop body and confirm the tracker is among them; absence is a finding.
 When equality or comparison helpers operate on encoded values where the same logical value admits more than one binary representation, the helper needs explicit canonicalization before comparing — bit-equal returns false for two values that mean the same thing.
 When a function picks a representation choice from a single threshold check while the correct choice depends on the joint values of multiple inputs, the result may be lossy.
 Loops that step a counter from a starting point up to some bound deserve a quick sanity check: does that bound still cover every valid entry the loop is supposed to visit?
@@ -1032,7 +1058,7 @@ ONLY report missing state variable updates in paired operations.
 <primary_targets>
 Report storage variables that are written in one path without a corresponding write in the paired/reverse path.
 Also flag tracker variables: when a loop's body uses a variable to remember the last item it processed but never writes the new item back at the end of each iteration, every subsequent pass compares against the original starting value instead of the actual previous item, and any logic conditional on that comparison silently stops doing its job.
-Pair counter-style state variables with the IDs they are meant to enumerate: a state variable that measures population size does not necessarily equal the assigned ID range, so any code that uses such a count as the upper limit of an enumeration may stop short of the actual data.
+Pair counter-style state variables with the IDs they are meant to enumerate: a state variable that measures population size does not also tell you the assigned ID range, so once entries can be removed (or IDs can skip values) any code that uses the count as the upper bound of an enumeration loop stops short of the actual data and silently omits live entries — e.g. an enumeration that iterates `0..count` misses every entry whose ID exceeds the current population size.
 Flag explicit numeric downcasts from wider to narrower types in token-amount handling: `uint160(amount)`, `uint128(amount)`, `uint96(amount)` where `amount` is a `uint256` silently truncates the high bits if `amount` exceeds the target type's max value. The truncated result is used as-is — producing a wrong transfer amount, wrong allowance, or wrong balance credit. Verify every downcast of a token amount or address-derived value has an explicit bounds check before the cast, or prove the input cannot exceed the target range.
 Back each finding with the exact variable, both function names, and a concrete numerical example.
 </primary_targets>
@@ -1215,7 +1241,7 @@ CHECK 1 — ACCOUNTING INTEGRITY:
 For each function that moves tokens, shares, or collateral: verify that all value inputs are balanced by outputs and storage updates.
 A gap between received and recorded value is a fund-loss bug.
 In multi-step operations (multi-hop swaps, batched deposits, routed trades), the OUTER function's take must balance with the INNER step's actual consumption plus any returned surplus; if the inner step consumes less than the outer function took, the shortfall MUST be returned explicitly via a concrete transfer call — a comment or placeholder is not a transfer.
-When the actual amount moved can be less than the amount requested, verify that what is debited from the caller and what is refunded to the caller together reconcile against what was actually consumed — never refunding a surplus that was never debited in the first place. In routes through multiple steps, confirm each step's surplus is handled exactly once: either carried forward or returned, but not both.
+When the actual amount moved can be less than the amount requested, verify that what is debited from the caller and what is refunded to the caller together reconcile against what was actually consumed — never refunding a surplus that was never debited in the first place. Make this concrete: when a swap or fill reduces its input because of insufficient liquidity or a per-step cap, there are exactly two self-consistent settlements — either charge the caller the FULL requested amount and refund the unused remainder, OR charge only the reduced (filled) amount and refund nothing. Doing BOTH — charging only the filled amount yet ALSO refunding (requested − filled) — drives the caller's net payment to zero or negative, handing them a free or profitable trade. Locate the single place where the caller's payment is finalized and confirm exactly one of the two settlements is used; a refund is owed only if the caller was first charged the full requested amount. In routes through multiple steps, confirm each step's surplus is handled exactly once: either carried forward or returned, but not both.
 
 CHECK 2 — DENOMINATION CONSISTENCY:
 Identify every arithmetic operation that combines two value-carrying quantities.
@@ -1227,7 +1253,7 @@ If no such floor exists, the exchange rate can be manipulated between submission
 Pay special attention to value-OUT paths (paths where the user ultimately receives tokens or shares from the contract).
 Verify each value-out path the contract supports exposes a way for the caller to enforce a minimum quantity actually delivered.
 A path whose only sizing input is an intent — without any received-quantity floor — leaves the caller defenseless to rate movement between submission and execution.
-Apply this check to BOTH directions of bidirectional operations: a function that adds liquidity AND removes liquidity needs slippage protection in BOTH directions, including when a single function encodes both directions through a signed parameter. Omitting the check in one direction is equivalent to having no slippage protection for that direction. Also check every position-exit path (close, unwind, settle, liquidate) — these are high-value paths that frequently lack slippage floors because developers focus protection on the entry path.
+Apply this check to BOTH directions of bidirectional operations: a function that adds liquidity AND removes liquidity needs slippage protection in BOTH directions, including when a single function encodes both directions through a signed parameter (positive = add, negative = remove) — verify the minimum-output check covers the absolute output on the removal direction, not only the addition direction. Omitting the floor on one direction is identical to having no slippage protection for that direction. Also check every position-exit path (close, unwind, settle, liquidate) — these are high-value paths that frequently lack slippage floors because protection is focused on entry.
 </method>
 
 <do_not_report>
@@ -1267,11 +1293,14 @@ The access-control gate is irrelevant if the input it trusts is externally contr
 Pay particular attention when the external dependency is a separately-deployed contract the protocol does not own and whose accounting can be moved by anyone interacting with that contract — donations to the underlying contract, deposits/withdrawals that change its share-price, or composition shifts in a pool it tracks — all of which can let the privileged mint use an inflated valuation as its sizing input.
 
 CHECK 3 — TRUSTED ROLE EXCEEDING OPERATIONAL SCOPE:
-For each privileged role (keeper, manager, relayer, operator, coordinator), identify every parameter they can supply to protocol functions and verify each is bounded by an explicit range check even for trusted roles. Economic parameters (fees, staleness windows, bonuses, ratios) left unbounded let a single misconfigured or griefing call put the protocol into a broken state that harms all users — the documented trust assumption does not substitute for an in-code bound.
+For each privileged role (keeper, manager, relayer, operator, coordinator), identify every parameter they can supply to protocol functions and verify each is bounded by an explicit range check even for trusted roles. Concretely: a role that can set a fee to its maximum, drop an oracle staleness window to zero (making every price instantly "fresh" / instantly stale), or set a liquidation or payout bonus to its maximum can put the protocol into a broken state in one call. The concern is not malice but misconfiguration or griefing — if no in-code bound clamps the value into the range the protocol still operates safely, the documented trust assumption does not eliminate the finding.
 
 CHECK 4 — PERMISSIONLESS FUNCTION WITH WEAPONIZABLE ARBITRARY PARAMETERS:
 For each function that is callable by any address AND accepts numeric parameters that directly influence protocol state, verify that an attacker cannot supply extreme or adversarial values to drive the protocol into an incorrect state. The harm need not be direct fund theft: forcing a pool or position into a degenerate configuration, draining reserves one-sided, or permanently locking other users' positions is a High finding even if the attacker does not directly profit.
-This extends to user-signed intents and orders: even when only authorized signers can submit them, the numeric fields within them must be validated on-chain at acceptance time. A field with no on-chain bound lets a signer set an extreme or near-zero value and realize a disproportionate outcome at settlement. Verify every settlement-influencing numeric parameter in an accepted signed message has a corresponding range check enforced in the settlement function, not just off-chain.
+This extends to user-signed intents and orders: even when only authorized signers can submit them, the numeric fields inside the signed payload must be validated on-chain at acceptance time. A price, rate, multiplier, or amplifier field with no on-chain bound lets a signer set an extreme or near-zero value at signing time — without posting extra collateral — and realize a disproportionate PnL or fee when the order settles. Verify every settlement-influencing numeric field in an accepted signed message has a corresponding range check enforced in the settlement function itself, not only in the off-chain signing flow.
+
+CHECK 5 — GOVERNANCE THRESHOLD / QUORUM INTEGRITY:
+For functions that decide a vote, proposal, or quorum outcome, trace exactly which quantity the pass/fail threshold is compared against. A proposal can be carried with far less than the intended support when (a) the threshold is computed against a denominator the attacker can shrink or inflate within the voting window (total supply that can be minted/burned, a snapshot taken at the wrong block, circulating vs total confusion), (b) the quorum reads current rather than snapshotted voting power so power can be borrowed (flash-loaned) for the vote, or (c) the comparison uses the wrong base so a small absolute power satisfies a percentage that was meant to require much more. Verify the threshold's numerator and denominator are both fixed at a manipulation-resistant snapshot and that the percentage actually requires the intended share of legitimate power.
 </method>
 
 <do_not_report>
@@ -1313,10 +1342,16 @@ For functions that both update state AND validate post-conditions: verify that s
 If a validity check uses values already modified in the same call, it may always pass.
 
 CHECK 3 — FACTORY PRE-EMPTION AND EXTERNAL DEPLOY DoS:
-For functions that call an external factory or deployer (create, deploy, create2, clone) to create a resource on behalf of the protocol: verify whether an attacker can pre-create the same resource before the protocol's call executes. If the resource address is deterministic (based on predictable parameters such as a token pair or salt), an attacker who creates it first can cause the protocol's creation step to revert permanently when the underlying factory reverts on an already-existing resource.
+For functions that call an external factory or deployer (create-pair / create-pool / deploy / create2 / clone) to create a resource on behalf of the protocol: verify whether an attacker can pre-create the same resource before the protocol's call executes. When the resource address is deterministic — derived from a token pair, a salt, or other publicly-known parameters — an attacker computes that address off-chain and creates the resource first; if the underlying factory reverts (rather than returning the existing resource) when the resource already exists, the protocol's creation step then reverts permanently and the dependent flow is bricked for everyone. This is a common DoS against pair/pool-creating launch flows where the pair address is fixed by token ordering.
 
 CHECK 4 — CANCELLED / TERMINAL RESOURCE DOUBLE-SPEND:
 When a resource (order, position, request, proposal) transitions to a terminal state (cancelled, closed, refunded), verify that every withdrawal / claim / redeem path reads and enforces the terminal state before releasing funds. A cancelled order that retains a withdrawable balance field can be exploited if the withdrawal function only checks whether funds were previously paid out, not whether the order is cancelled — an attacker can cancel to recover principal and then withdraw again using a path that checks only the non-cancelled flag.
+
+CHECK 5 — HELD FUNDS WITH NO EXIT PATH:
+When funds (or staked principal, or collateral) enter an intermediate holding state — a buffer, escrow, pending-queue, or "received but not yet allocated" bucket — verify there exists a reachable function that moves them OUT of that state to their intended destination (a withdrawal, a forwarding to the next layer, a re-allocation). A value that flows into a holding field but has no code path that ever debits that field is silently and permanently locked: trace every credit to a balance/buffer storage field and confirm at least one callable path decrements it and releases the value. Also flag the inverse mishandling — value that arrives from an external source (a native-token receive, a settled withdrawal, a returned amount) into a path whose accounting does not record it, so it cannot later be attributed or withdrawn.
+
+CHECK 6 — DENIAL OF SERVICE VIA UNCONDITIONAL REVERT:
+When a function in a shared or batched path reverts on a condition an ordinary participant can trigger — e.g. a "set-or-throw" write that reverts if a slot/flag/bit is already set, an insert into a structure that rejects duplicates, or an operation that reverts on an empty/zero collection — verify that revert cannot be forced by one actor to block the operation for everyone else. A set-once structure written from a path that multiple users share, or a loop step that reverts on one bad element, lets a single actor permanently brick the shared operation. Report the (revert condition, shared path, blocked victims) triple.
 </method>
 
 <do_not_report>
@@ -1363,7 +1398,7 @@ CHECK 3 — REPLACEMENT FUNCTION MISSING SAFETY PARAMETERS:
 When a function supersedes or replaces a deprecated/removed function (indicated by comments referencing old function names, merged entry points, or a "v2 replaces v1" migration pattern), verify the replacement preserved ALL safety parameters from the original — in particular minimum-output amounts, slippage bounds, and deadline checks. A replacement that merges two old functions but omits the slippage parameter from one of them silently removes user protection on that code path: any swap or withdrawal through the replacement function that was previously slippage-protected is now fully front-runnable because the minimum-output check is absent.
 
 CHECK 4 — STATE RESET ON OWNERSHIP CHANGE:
-For functions that transfer an accounting object (position, vesting record, stake, or similar) from one holder to another: identify every field that encodes the previous holder's interaction history rather than the object's intrinsic state. Verify each such field is either reset to the correct initial value for the new holder, or intentionally preserved where the new holder genuinely inherits that history. History fields carried over unchanged can let the new holder claim, unlock, or accrue more than they are entitled to, or compute a rate from values that no longer match the transferred amount.
+For functions that transfer an accounting object (position, vesting record, stake, time-series schedule) from one holder to another: identify every field that encodes the PREVIOUS holder's interaction history rather than the object's intrinsic state — a counter of already-claimed steps or epochs, a reward-debt accumulator, a claim index, accumulated points, or a release rate derived from the original holder's grant. Verify each is either reset to the correct initial value for the new holder, or deliberately preserved only where the new holder is meant to inherit the exact schedule position. Two concrete failures: (1) a claimed-steps counter or claim index carried over unchanged lets the new holder skip the waiting the previous holder already consumed and unlock future periods immediately, or replay steps already completed; (2) a release/unlock rate computed from the original holder's grant amount but now applied to a smaller transferred amount produces a wrong unlock speed. The rule: history fields describe the previous holder's relationship to the schedule, not the object itself, so they must almost always be zeroed or recomputed against the new holder's starting conditions.
 </method>
 
 <do_not_report>
@@ -1481,7 +1516,7 @@ When (a) or (b) is missing, the local books drift and either users withdraw amou
 When (c) is missing, the user silently absorbs losses the external venue imposes.
 
 CHECK 3 — FEE-RELEVANT STATE COVERAGE ON INVERSE PATHS:
-When a contract collects performance fees by comparing two snapshots (current balance vs. recorded principal, current share price vs. last index, current total assets vs. previous mark), enumerate every path that withdraws / unwinds / closes a position and verify each also updates the recorded baseline the fee formula reads from. A path that moves assets without updating the baseline causes the next fee accrual to attribute fictitious profit or loss to the period.
+When a contract collects performance fees by comparing two snapshots (current balance vs. recorded principal, current share price vs. last index, current total assets vs. previous mark), enumerate EVERY path that moves the underlying — both the forward paths that grow it and the inverse paths that shrink it — and verify each one updates the recorded baseline the fee formula reads from. The common bug: the baseline is written on the forward (grow) paths but left stale on an inverse (shrink) path, so the next fee accrual compares a live balance against a baseline that no longer matches and attributes fictitious profit (over-charging) or fictitious loss (skipping fees owed). Any inverse path that moves assets without writing the baseline is a finding.
 
 CHECK 4 — MINTING FROM MANIPULABLE AGGREGATED VALUE:
 For any function that mints tokens (new shares, yield tokens, reward tokens, governance tokens) in an amount derived from a formula like: mint_amount = current_value - baseline where current_value is computed by aggregating external asset values (vault total assets, LP-position value, strategy value, or any similar aggregation over a set of external contracts): verify that EACH of those external readings is manipulation-resistant.
@@ -1492,7 +1527,7 @@ Report this as a standalone "over-minting" finding distinct from any role-contro
 Name the exact external aggregation helper and the mint function.
 
 CHECK 5 — REWARD CHECKPOINT BEFORE BENEFICIARY CHANGE:
-For any function that changes who receives ongoing yield, rewards, or fee rebates: verify that pending rewards attributable to the current beneficiary are snapshotted and credited before the beneficiary is updated. Updating the recipient before settling accrued rewards either hands the previous holder's earnings to the new recipient or loses them entirely.
+For any function that changes who receives ongoing yield, rewards, or fee rebates (a delegation setter, a claimer-address update, a reward-recipient setter, a stake/position transfer that moves yield rights): verify the correct three-step ordering — (1) compute pending rewards for the CURRENT beneficiary from pre-change state, (2) credit them to the current beneficiary, (3) only then update the recipient mapping. A function that updates the recipient first and computes pending rewards afterward attributes the previous holder's earned yield to the new recipient; a function that clears the accumulator without first checkpointing loses those rewards entirely. Any beneficiary-reassignment path missing the pre-change checkpoint is a finding.
 </method>
 
 <do_not_report>
@@ -1969,7 +2004,7 @@ This prompt targets files that implement AMM swap logic, liquidity management, o
 
 <method>
 CHECK 1 — AMM INVARIANT PRESERVATION:
-For each swap or trade function, verify the pool's core invariant (constant-product for CPMM, the stableswap invariant, etc.) still holds after the operation. Pay attention to operations that route through multiple pools or split a trade — each sub-operation must preserve the invariant independently — and to the order in which fees are applied relative to the invariant check.
+For each swap or trade function, verify the pool's core invariant (constant-product for CPMM, the stableswap invariant, etc.) still holds after the operation. Two concrete failure shapes: (1) disjoint or split swaps — an operation that withdraws liquidity from one side and re-adds to another, or routes through multiple pools, can satisfy each leg locally while violating the overall invariant if the intermediate state is not accounted; check each sub-operation preserves the invariant independently. (2) fee-application order — verify fees are applied before or after the invariant check exactly as the formula requires; applying them in the wrong order inflates or deflates the effective invariant and lets value leak.
 
 CHECK 2 — DECIMAL NORMALIZATION:
 When a pool handles tokens with different decimal counts, verify all amounts are normalized to a common precision before any invariant or pricing calculation and de-normalized afterward. Operating on raw amounts of differently-scaled tokens produces a wrong result.
@@ -1978,7 +2013,7 @@ CHECK 3 — POOL INITIALIZATION AND EDGE CASES:
 For pool creation and initial liquidity addition, verify the protocol handles the zero-liquidity case (which otherwise causes division-by-zero on the first operation) and rejects or correctly handles tokens with non-standard decimals at initialization time.
 
 CHECK 4 — EXTERNAL DEX PROTOCOL COMPATIBILITY:
-When the contract calls into an external DEX, verify the call interface matches the actual deployed protocol version (forks may differ in signatures or fee structure), that multi-step pool interactions retrieve tokens correctly rather than leaving them credited inside the pool, and that any assumption about token slot ordering (token0/token1) is resolved by querying the pool at runtime rather than hardcoded — a hardcoded ordering assumption reverses direction or fee selection when addresses sort the opposite way. For factory calls that create a pool/pair, verify the case where the resource already exists is handled, since a revert-on-exists factory can be blocked by pre-creation.
+When the contract calls into an external DEX, verify: (a) the call interface matches the actual deployed protocol version — a fork may add/remove parameters or change the fee structure under the same function name, so calling against the wrong signature aborts at runtime; (b) multi-step pool interactions actually retrieve the tokens they are owed — some pool operations only CREDIT tokens to a position internally and require a separate explicit collect/withdraw call to transfer them out; an integration that performs the first step but omits the second leaves funds stranded in the pool; (c) any decision about swap direction or which side is input/output is resolved by QUERYING the pool's token ordering at runtime, never hardcoded — pools sort their two tokens by address, so a hardcoded assumption that a specific named token always occupies a given slot produces a reversed direction (or a wrong fee tier) whenever the addresses sort the opposite way, sending the swap the wrong way. (d) For factory calls that create a pool/pair, verify the already-exists case is handled, since a revert-on-exists factory can be blocked by pre-creation.
 
 CHECK 5 — LIQUIDITY CALCULATION FORMULA:
 For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range.
@@ -3245,7 +3280,7 @@ PROTOCOL MODEL CONTEXT
 
         ins_paths, ins_prefixes, ins_globs, oos_paths, oos_prefixes, oos_globs = _collect_scope(source_dir)
         _has_allowlist = bool(ins_paths or ins_prefixes or ins_globs)
-        _ALWAYS_EXCLUDE = frozenset({'node_modules', '.git', 'artifacts', 'cache', 'out', 'dist', 'build', 'broadcast'})
+        _ALWAYS_EXCLUDE = frozenset({'node_modules', '.git', 'artifacts', 'cache', 'out', 'dist', 'build', 'broadcast', 'generated'})
         _SOFT_EXCLUDE = frozenset({'test', 'tests', 'script', 'scripts', 'mocks', 'mock', 'interfaces', 'lib', 'libraries'})
         exclude_dirs = _ALWAYS_EXCLUDE if _has_allowlist else _ALWAYS_EXCLUDE | _SOFT_EXCLUDE
         files = set(files)
@@ -4882,6 +4917,6 @@ if __name__ == '__main__':
     time.sleep(10)
     fetch_projects()
     inference_api = 'http://localhost:8087'
-    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/code4rena_lambowin_2025_02'
+    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/code4rena_superposition_2025_01'
 
     report = agent_main(project, inference_api=inference_api)
