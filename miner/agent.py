@@ -16,11 +16,11 @@ from dataclasses import dataclass, field as dataclass_field
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
-# PRIMARY_MODEL outputs structured JSON directly — it uses analyze_file() with all specialized
-# prompts intact and thinking_budget=2048 for Tier-2 passes.  Reasoning capability is provided
-# by thinking_budget (PRIMARY_MODEL), THINKING_MODEL (protocol classification + verifier), and
-# ROUTER_MODEL (agentic deep-dive) rather than a 2-step text→JSON pipeline.
-PRIMARY_MODEL = "qwen/qwen3.6-35b-a3b"
+# PRIMARY_MODEL is the high-volume scan model. It runs analyze_file() with all specialized
+# prompts intact. A fast non-reasoning instruct model is used here for scan throughput;
+# reasoning capability for the pipeline is provided by THINKING_MODEL (protocol classification
+# + verifier) and ROUTER_MODEL (agentic deep-dive), not by the scan stage.
+PRIMARY_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 
 # Non-reasoning model: used for all non-discovery steps (merge, cluster, JSON structuring, related-file lookup).
 JSON_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
@@ -35,8 +35,28 @@ HIGH_STANDARD_MODELS = frozenset({"x-ai/grok-4.3"})
 THINKING_MODEL = "qwen/qwen3-235b-a22b-thinking-2507"
 
 # Router model: high-capacity instruct model for agentic deep-dive.
-# Better cross-file reasoning than qwen3.6 while still supporting tool-use.
+# Better cross-file reasoning than the scan model while still supporting tool-use.
 ROUTER_MODEL = "qwen/qwen3-235b-a22b-2507"
+
+# Single source of truth for the per-inference-call request timeout (seconds).
+# Every analyze / agentic / verifier inference call caps its request at this value
+# so one slow call can never eat the run budget.
+REQUEST_TIMEOUT = 300
+
+
+def _choose_thread_count(n_pairs: int) -> int:
+    """Scale the scan thread pool to the estimated (file, prompt) pair count.
+
+    Small projects: fewer concurrent calls avoids proxy 502 storms.
+    Large projects: more threads fits the work within the scan budget.
+    Thresholds calibrated for ~13 prompts/file (5 Tier-2 + ~8 Tier-3/4 average).
+    """
+    if n_pairs <= 60:
+        return 8
+    if n_pairs < 180:
+        return 16
+    return 24
+
 
 # Provider routing per model — slugs verified from OpenRouter /api/v1/models/{id}/endpoints.
 # ignore: providers with observed structural failures or speed too low to complete within timeout.
@@ -101,26 +121,61 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
     - Do NOT report: admin-gated functions as "missing access control", gas optimizations, theoretical issues without exploit paths.
 """)
 
+# A trailing test-MODULE marker, anchored to the start of a line (optionally indented):
+#   - `#[cfg(test)]` (or `#[cfg(all(test,...))]`) immediately followed by a `mod <name>`
+#     declaration — the conventional `#[cfg(test)] mod tests { ... }` block appended at the
+#     end of a file; OR
+#   - a bare `mod test` / `mod tests` declaration with no attribute.
+# We deliberately target the test MODULE, not stray inline `#[cfg(test)] fn` attributes:
+# those appear on individual trait methods / helpers interspersed with REAL code, so
+# truncating at them would drop in-scope source (e.g. types.rs). Line-anchoring
+# (re.MULTILINE) also avoids false hits on `cfg`/`test` in expressions / `mod test_utils`.
+# Between the closing `]` and `mod` we allow any run of whitespace, line comments, or block
+# comments — so an attribute separated from `mod` by a blank line, a trailing/standalone
+# comment, or written on the same line still matches. This still SKIPS inline
+# `#[cfg(test)] fn`: between such a fn and any later `mod` there is real code (not
+# whitespace/comment), so the separator run stops before reaching `mod`.
+_RS_TEST_MOD_RE = re.compile(
+    r'^[ \t]*#\s*\[\s*cfg\s*\(\s*(?:all\s*\(\s*|any\s*\(\s*)?test\b[^\n]*\]'
+    r'(?:\s|//.*|/\*[\s\S]*?\*/)*'
+    r'(?:pub\s+)?mod\s+\w+'
+    r'|^[ \t]*(?:pub\s+)?mod\s+tests?\b',
+    re.MULTILINE)
+
+def strip_rust_test_modules(src: str) -> str:
+    """Drop the trailing Rust test module by truncating the file at the first
+    `#[cfg(test)] mod ...` (or bare `mod test`/`mod tests`) declaration. By convention the
+    test module is appended at the END of a file after the real code, so everything before
+    it is the in-scope source. Inline `#[cfg(test)]` attributes on individual items are left
+    untouched (they sit among real code). Returns `src` unchanged when no test module is
+    present. Cuts input tokens substantially on `.rs` files that carry test modules."""
+
+    m = _RS_TEST_MOD_RE.search(src)
+    if not m:
+        return src
+    
+    return src[:m.start()].rstrip() + '\n'
 
 def read_file_text(path, encoding: str = 'utf-8') -> str:
-    """Read and return the full text of a file."""
+    """Read and return the full text of a file; strips Rust `#[cfg(test)]` modules."""
 
     with open(path, 'r', encoding=encoding) as fh:
+        text = fh.read()
 
-        return fh.read()
-
+    if str(path).endswith('.rs'):
+        text = strip_rust_test_modules(text)
+    
+    return text
 
 def safe_lower(s: Optional[str]) -> str:
     """Return lowercased string, or empty string when value is None."""
 
     return (s or "").lower()
 
-
 def clamp(val: float, lo: float, hi: float) -> float:
     """Clamp val to the closed interval [lo, hi]."""
 
     return max(lo, min(hi, val))
-
 
 def word_count(text: str) -> int:
     """Return the number of whitespace-delimited words in text."""
@@ -921,7 +976,7 @@ Identify the contract's role and apply execution-context scrutiny appropriate to
 Look for execution-context and resource-control bugs: gas griefing, partial-execution failure handling, variable-lifecycle issues, and ordering mistakes.
 Storage that the contract reads during an authorization decision is part of the access-control surface — every function that writes into such storage extends the trust boundary, and an unguarded writer here is equivalent to letting any caller self-onboard into the trusted set.
 Subcalls and inline-assembly fragments may contain halt-style flow-control that terminates the surrounding transaction without surfacing an error to the calling code; review every fragment and verify the caller's flow handles a silent termination correctly.
-Verify that subcalls are guaranteed enough gas, that state writes happen at the right point relative to external calls, and that resource handles (allowances, flags, nonces) are reset on every exit path — including the path where the subcall consumed only part of the granted resource.
+Verify that subcalls are guaranteed enough gas, that state writes happen at the right point relative to external calls, and that resource handles (allowances, flags, nonces) are reset on every exit path — including the path where the subcall consumed only part of the granted resource. A specific high-value shape: a multi-step entry point consumes a single-use credential up front (a nonce, a one-time permit, a lock flag) and then dispatches to an inner sub-call whose failure is NOT propagated as a top-level revert (it is swallowed, returned as a bool, or run under a caller-selected mode). Because of the EVM's 63/64 gas-forwarding rule, an external caller who sets the outer transaction's gas limit can starve the inner sub-call so it runs out of gas and fails, while the entry point's prologue and epilogue still complete — so the credential is burnt and the user's intended action silently does not happen. Flag every (credential-consumed-up-front, inner sub-call, non-reverting failure) triple where the caller controls the gas.
 After any external call that consumes a granted resource, walk through every return path (success, partial-consume, revert-but-handled, early-return on insufficient balance) and verify the cleanup statement is actually reached on each.
 Function parameters that designate ownership of funds being moved should not be freely caller-controlled — when the caller can name any account whose funds the function operates on, the function may operate on accounts the caller has no relationship to.
 Spending authority granted by the contract to other contracts should be scoped to the immediate operation rather than to the maximum a token allows.
@@ -1124,6 +1179,8 @@ Anything the function records in storage before its final check is observable to
 External calls are a special case.
 Anywhere the function calls into untrusted or partially-trusted external code before completing its own storage writes, the callee can read the intermediate state, re-enter, or change external state the function will then act on.
 Even non-reentrant external calls become unsafe when the function relies on values it computed pre-call.
+
+Signed-operation front-running: when a function is permissionlessly callable and executes a payload that was authorized by a signature (a batched call, an order, an intent, a meta-transaction), the signed payload sitting in the mempool can be submitted by ANYONE, not just the intended relayer. Check what an unintended submitter gains: front-running the legitimate submitter to claim a reward/refund/gas reimbursement meant for the relayer, forcing the operation to land at an attacker-chosen moment or ordering, or grief-submitting it in a state where it wastes the signer's nonce or reverts. A signature that authorizes WHAT happens but not WHO submits it leaves every such effect to the first observer of the mempool.
 
 Report concrete sequences: state X was written at step N, the check at step N+M reads slot Y which was not updated, so the check passes despite the protocol being in state X' which violates the intended invariant.
 </primary_targets>
@@ -1895,7 +1952,7 @@ SOLIDITY_FAMILY_SUFFIXES = frozenset({".sol", ".vy", ".yul"})
 # coverage across all four sub-domains in the breadth-first stage.
 CORE_PROMPT_NAMES = frozenset({"SYSTEM_A1", "SYSTEM_A2", "SYSTEM_A3", "SYSTEM_A4", "SYSTEM_B", "SYSTEM_E", "SYSTEM_SV", "SYSTEM_ORDER"})
 
-# Tier 2: always run for every file, with thinking ON (budget 2048 tokens).
+# Tier 2: always run for every file (non-reasoning scan model — thinking off).
 # These five prompts cover the highest-value invariants (fund-flow, access control).
 TIER2_PROMPT_NAMES = frozenset({"SYSTEM_A1", "SYSTEM_A2", "SYSTEM_A3", "SYSTEM_A4", "SYSTEM_B"})
 
@@ -2581,7 +2638,7 @@ class BaselineRunner:
 
         print(f"[INFO] Runner init | model={self.model} | api={self.inference_api} | key_set={bool(self.inference_api_key)}")
 
-    def inference(self, messages: dict[str, Any], model: str = None, timeout:int = 650, temperature: float = 0.01, call_type: str = "analyze", file: str = "-", tools: list = None, tool_choice=None, thinking_budget: int = 0) -> dict[str, Any]:
+    def inference(self, messages: dict[str, Any], model: str = None, timeout:int = REQUEST_TIMEOUT, temperature: float = 0.01, call_type: str = "analyze", file: str = "-", tools: list = None, tool_choice=None, thinking_budget: int = 0) -> dict[str, Any]:
         """POST to the bitsec proxy; PRIMARY_MODEL returns `content` at top level, not inside `choices`."""
 
         used_model = model or self.config.get('model', PRIMARY_MODEL)
@@ -2867,7 +2924,10 @@ class BaselineRunner:
             return json.dumps({"error": f"Not a file: {file_path}"})
 
         try:
-            return target.read_text(encoding="utf-8")[:50_000]
+            _txt = target.read_text(encoding="utf-8")
+            if target.suffix == ".rs":
+                _txt = strip_rust_test_modules(_txt)
+            return _txt[:50_000]
         except Exception as e:
             return json.dumps({"error": str(e)})
 
@@ -2943,7 +3003,7 @@ class BaselineRunner:
                 tool_choice = "auto"
 
             try:
-                _ag_timeout = min(650, max(5, int(deadline - time.monotonic())))
+                _ag_timeout = min(REQUEST_TIMEOUT, max(5, int(deadline - time.monotonic())))
                 response = self.inference(messages=messages, model=_ag_model, timeout=_ag_timeout, call_type="agentic", file=relative_path, tools=TOOL_DEFINITIONS, tool_choice=tool_choice)
             except requests.exceptions.HTTPError as exc:
                 _status = exc.response.status_code if exc.response is not None else 0
@@ -2951,7 +3011,7 @@ class BaselineRunner:
                     print(f"[agentic] ROUTER_MODEL {_status} → falling back to THINKING_MODEL for {relative_path}")
                     _ag_model = THINKING_MODEL
                     try:
-                        _ag_timeout = min(650, max(5, int(deadline - time.monotonic())))
+                        _ag_timeout = min(REQUEST_TIMEOUT, max(5, int(deadline - time.monotonic())))
                         response = self.inference(messages=messages, model=_ag_model, timeout=_ag_timeout, call_type="agentic", file=relative_path, tools=TOOL_DEFINITIONS, tool_choice=tool_choice)
                     except Exception:
                         break
@@ -3020,7 +3080,7 @@ class BaselineRunner:
 
         return all_vulns, total_in, total_out
 
-    def analyze_file(self, source_dir: Path, relative_path: str, related_files_list: list[str], model: str = None, system_prompt: str = None, prompt_name: str = None, context: str = None, sleep_timeout: int = 5, inference_timeout: int = 650, temperature: float = 0.01, thinking_budget: int = 0, protocol_context: str = None, rs_flavor: str = "")  -> tuple[Vulnerabilities, int, int]:
+    def analyze_file(self, source_dir: Path, relative_path: str, related_files_list: list[str], model: str = None, system_prompt: str = None, prompt_name: str = None, context: str = None, sleep_timeout: int = 5, inference_timeout: int = REQUEST_TIMEOUT, temperature: float = 0.01, thinking_budget: int = 0, protocol_context: str = None, rs_flavor: str = "")  -> tuple[Vulnerabilities, int, int]:
         """Run one (file, prompt) analysis in a thread-pool worker; returns (Vulnerabilities, input_tokens, output_tokens).
 
         rs_flavor: project-level Rust chain hint ("anchor"|"cosmwasm"|"generic"|"").
@@ -3035,6 +3095,11 @@ class BaselineRunner:
 
         with open(source_dir / file_path, 'r', encoding='utf-8') as f:
             main_file_content = f.read()
+
+        # Drop Rust test modules (#[cfg(test)]) before scanning — they are not in
+        # vulnerability scope and inflate input tokens (often 40K+ on .rs files).
+        if str(file_path).endswith('.rs'):
+            main_file_content = strip_rust_test_modules(main_file_content)
 
         system_prompt = system_prompt.replace(
             "{format_instructions}",
@@ -3985,9 +4050,9 @@ PROTOCOL MODEL CONTEXT
             _proto_dl = getattr(self, '_proto_deadline', None)
             if _proto_dl is not None and time.time() >= _proto_dl:
                 return {}  # split deadline passed — skip classification
-            # 300s per call: keeps each classification within the proxy timeout.
+            # REQUEST_TIMEOUT per call: keeps each classification within the proxy timeout.
             # Phase 0 runs serially in the background overlapping with Phase 1.
-            _proto_timeout = min(300, max(5, int(_proto_dl - time.time()))) if _proto_dl is not None else 300
+            _proto_timeout = min(REQUEST_TIMEOUT, max(5, int(_proto_dl - time.time()))) if _proto_dl is not None else REQUEST_TIMEOUT
             resp = self.inference(
                 messages=messages, model=THINKING_MODEL, timeout=_proto_timeout,
                 call_type="protocol_model", file=relative_path, thinking_budget=1024,
@@ -4065,7 +4130,7 @@ PROTOCOL MODEL CONTEXT
                 continue
 
             if name in TIER2_PROMPT_NAMES:
-                continue  # handled separately in Phase 1 with thinking ON
+                continue  # handled separately in Phase 1 (breadth-first core pass)
 
             if name in TIER3_PROMPT_NAMES:
                 selected.append((name, prompt))
@@ -4163,7 +4228,7 @@ PROTOCOL MODEL CONTEXT
                 )
                 resp = self.inference(
                     messages=[{"role": "system", "content": VERIFIER_SYSTEM}, {"role": "user", "content": user_msg}],
-                    model=THINKING_MODEL, timeout=650, call_type="verifier", file=file_path, thinking_budget=2048,
+                    model=THINKING_MODEL, timeout=REQUEST_TIMEOUT, call_type="verifier", file=file_path, thinking_budget=2048,
                 )
                 content_str = (resp.get("content") or resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
                 data = self.clean_json_response(content_str)
@@ -4233,7 +4298,7 @@ PROTOCOL MODEL CONTEXT
         verifier window, so the effective verifier and merge slots vary per run.
 
         Phase 0 : Protocol model on all ranked files (THINKING_MODEL, serial background)
-        Phase 1 : Tier 2 breadth — A1-A4, B for all files, thinking_budget=2048
+        Phase 1 : Tier 2 breadth — A1-A4, B for all files (thinking off)
         Phase 2 : Tier 3-4 depth — role-filtered prompts per file, JSON_MODEL
         Phase 4 : Agentic deep-dive on top-5 files (ROUTER_MODEL) — runs BEFORE Phase 3;
                   requires ≥90 s remaining so the deep-dive is never starved by Phase 3
@@ -4275,8 +4340,12 @@ PROTOCOL MODEL CONTEXT
         file_cap = min(18, num_files)
         files_skipped = num_files - file_cap
         use_two_pass = os.getenv('TWO_PASS', 'false').lower() != 'false'
-        max_threads = 12
         ranked_files = files[:file_cap]
+
+        # Scale thread count to estimated (file, prompt) pair workload.
+        # 5 Tier-2 prompts run on every file; Tier-3/4 adds ~8 more on average.
+        _n_pairs_est = len(ranked_files) * (len(TIER2_PROMPT_NAMES) + 8)
+        max_threads = _choose_thread_count(_n_pairs_est)
 
         if not ranked_files:
             return AnalysisResult(
@@ -4313,7 +4382,10 @@ PROTOCOL MODEL CONTEXT
 
         for f in ranked_files:
             try:
-                file_texts[f] = f.read_text(encoding='utf-8', errors='ignore')
+                _ft = f.read_text(encoding='utf-8', errors='ignore')
+                if f.suffix == '.rs':
+                    _ft = strip_rust_test_modules(_ft)
+                file_texts[f] = _ft
             except Exception:
                 file_texts[f] = ""
 
@@ -4420,9 +4492,9 @@ PROTOCOL MODEL CONTEXT
                 return None
 
             # Timeout = time until the deferred-collection window closes (scan_deadline + 90s).
-            # Caps at 650s so early calls are not penalised.  Late calls get a tighter cap
-            # so they don't keep running past the point where their result can still be collected.
-            _effective_timeout = min(650, _scan_remaining + 90)
+            # Caps at REQUEST_TIMEOUT so early calls are not penalised.  Late calls get a tighter
+            # cap so they don't keep running past the point where their result can still be collected.
+            _effective_timeout = min(REQUEST_TIMEOUT, _scan_remaining + 90)
 
             f = executor.submit(
                 self.analyze_file, source_dir, rel_path, related,
@@ -4477,7 +4549,7 @@ PROTOCOL MODEL CONTEXT
             # Cap _run_protocol_model() timeout when Phase 3 is disabled: Phase 0
             # output is only needed until Phase 2 is submitted (8-min split), so
             # calls that start near or past that point skip immediately or use a
-            # reduced timeout rather than running the full 300s.
+            # reduced timeout rather than running the full REQUEST_TIMEOUT.
             self._proto_deadline = (start_time + PHASE1_SPLIT_SECS) if not use_two_pass else None
             proto_executor = ThreadPoolExecutor(max_workers=2)
             proto_future_by_rel: dict[str, Future] = {}
@@ -4525,7 +4597,7 @@ PROTOCOL MODEL CONTEXT
                     if name not in TIER2_PROMPT_NAMES:
                         continue
 
-                    f = _submit_analyze(rel, related, name, prompt, tb=2048)
+                    f = _submit_analyze(rel, related, name, prompt)
 
                     if f is None:
                         continue
@@ -4714,7 +4786,7 @@ PROTOCOL MODEL CONTEXT
                             if name not in TIER2_PROMPT_NAMES:
                                 continue
 
-                            f = _submit_analyze(rel, related, f"{name}_r2", prompt, mdl=PRIMARY_MODEL, tb=2048, temp=0.15, pctx=pc)
+                            f = _submit_analyze(rel, related, f"{name}_r2", prompt, mdl=PRIMARY_MODEL, temp=0.15, pctx=pc)
 
                             if f is None:
                                 continue
@@ -4761,8 +4833,8 @@ PROTOCOL MODEL CONTEXT
         # ----------------------------------------------------------------
 
         # Pre-cap per file before verifier so each per-file prompt stays within the
-        # 500s inference budget.  Without this, files with 22+ prompts can produce
-        # 80-100 raw findings, generating a ~10K-token prompt that can exceed the old 300s cap.
+        # REQUEST_TIMEOUT inference budget.  Without this, files with 22+ prompts can produce
+        # 80-100 raw findings, generating a ~10K-token prompt that can exceed the REQUEST_TIMEOUT cap.
         # Keep the top-60 by (confidence DESC, rule_score DESC) as a safety net for extreme
         # outlier files (150+ findings); 60 findings × ~130s inference < 500s budget.
         _VERIFIER_PRE_CAP = 60
