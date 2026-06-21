@@ -16,6 +16,16 @@ from dataclasses import dataclass, field as dataclass_field
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
+# Single source of truth for the per-inference-call request timeout (seconds).
+# Every analyze / agentic / verifier inference call caps its request at this value
+# so one slow call can never eat the run budget.
+REQUEST_TIMEOUT = 300
+
+CONFIDENCE_THRESHOLD = 0.75
+
+MAX_FILES_TO_ANALYZE = 30
+MAX_FILE_CAP = 22
+
 # PRIMARY_MODEL is the high-volume scan model. It runs analyze_file() with all specialized
 # prompts intact. A fast non-reasoning instruct model is used here for scan throughput;
 # reasoning capability for the pipeline is provided by THINKING_MODEL (protocol classification
@@ -27,7 +37,7 @@ JSON_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 
 # High-standard models apply strict internal criteria and self-report fewer findings at lower
 # confidence scores. Relax the post-processing confidence gate for their outputs so we don't
-# silently discard valid findings that a lower-standard model would have reported at 0.75.
+# silently discard valid findings that a lower-standard model would have reported at CONFIDENCE_THRESHOLD.
 HIGH_STANDARD_MODELS = frozenset({"x-ai/grok-4.3"})
 
 # Thinking model: used for protocol-model stage and verifier soft-rank.
@@ -37,12 +47,6 @@ THINKING_MODEL = "qwen/qwen3-235b-a22b-thinking-2507"
 # Router model: high-capacity instruct model for agentic deep-dive.
 # Better cross-file reasoning than the scan model while still supporting tool-use.
 ROUTER_MODEL = "qwen/qwen3-235b-a22b-2507"
-
-# Single source of truth for the per-inference-call request timeout (seconds).
-# Every analyze / agentic / verifier inference call caps its request at this value
-# so one slow call can never eat the run budget.
-REQUEST_TIMEOUT = 300
-
 
 def _choose_thread_count(n_pairs: int) -> int:
     """Scale the scan thread pool to the estimated (file, prompt) pair count.
@@ -73,12 +77,12 @@ _PROVIDER_ROUTING: dict[str, dict] = {
         # ambient: 25-46 tok/s; io-net: silent TCP failures; siliconflow: 17 tok/s; wandb: 32K hard cap
         # atlas-cloud: ignores max_tokens → 82K natural stop @ 234 tok/s (352s) — viable with 500s timeout
         # order removed — OR auto-balances across Parasail/AkashML/AtlasCloud/Alibaba/etc.
-        "ignore": ["ambient", "io-net", "siliconflow", "wandb"],
+        "ignore": ["deepinfra"],
     },
     JSON_MODEL: {
         # deepinfra: 16K max_completion cap; novita: 32K cap at same price as atlas-cloud (131K cap) — strictly worse
         # order removed — OR auto-balances across Parasail/AtlasCloud/Alibaba/Google Vertex
-        "ignore": ["deepinfra", "novita"],
+        "ignore": ["deepinfra"],
     },
     ROUTER_MODEL: {
         # deepinfra/novita/google-vertex/streamlake/alibaba: ≤32K max_completion — too low for agentic context buildup
@@ -112,12 +116,19 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
     15. Initialization correctness: a factory that sets owner=address(this) (or any placeholder) on a child makes the child's owner-only functions permanently uncallable; an onboarding helper that seeds a score/rank/index at its maximum grants unearned rewards from block one; a time guard comparing block.timestamp to a stored deadline passes immediately when that deadline is still zero. Verify intended owner/beneficiary/baseline are set and zero states are rejected.
     16. Beneficiary-change ordering: a function that changes who receives yield must checkpoint and credit the current beneficiary's pending rewards BEFORE updating the recipient mapping; updating first hands the prior holder's earned yield to the new recipient.
     17. Function-replacement parity: when one function supersedes/merges deprecated ones, a dropped slippage-min, deadline, or per-path validation on one merged path silently removes user protection there — verify the replacement preserves ALL safety parameters from each original.
+    18. Dispatcher-to-implementation signature parity: when a project uses a routing, proxy, or dispatcher layer that declares public function signatures and delegates calls to an underlying implementation module, verify that each declared external signature matches the corresponding implementation's callable signature exactly. A mismatch in parameter count or parameter type between what the dispatcher declares and what the implementation provides produces different function selectors — the external function then routes to a non-matching entry point, making the intended implementation unreachable. The implementation may appear to exist and be correct in the source, but no external caller can reach it because the selector computed from the declared interface does not match any reachable entry point in the implementation layer. Check two cases: (a) the dispatcher declares a function that has no corresponding implementation entry point at all (silent no-op or revert for every caller); (b) the dispatcher and implementation both declare a function by the same name but with different parameter lists — the two selectors differ, so the dispatcher routes to nothing that satisfies the implementation's signature. In either case the declared function is effectively absent from the reachable interface. CRITICAL: compare the complete parameter list from position 0 (the first argument). A mismatch at any position — including the first — changes the computed selector. If one side includes a leading parameter that the other side omits entirely, the remaining parameters shift by one index and the selectors diverge even when the interior of the two lists appears identical by name. Do not infer a match from shared parameter names found after the first argument; the full list from index 0 must match exactly.
+       When you identify an unreachable function, apply two follow-on steps: first, determine what protective action or service it was intended to provide — position-exit, liquidity-removal, minimum-output enforcement, access-control gate; second, enumerate every REACHABLE path (those where dispatcher and implementation signatures align) that performs the same action, and verify each reachable path provides equivalent protections. If the only reachable path for a fund-moving exit action uses a single signed-delta parameter (positive = add, negative = remove) without per-asset minimum-received parameters, callers have no way to set a slippage floor — flag it as a fund-loss vulnerability.
+       Priority order when multiple mismatches exist: check user-facing fund-withdrawal and position-exit functions BEFORE admin-gated or governance functions. A mismatch that makes a user exit path unreachable causes immediate per-user fund loss; an admin-function mismatch causes governance failure. Both are valid findings, but the user-exit mismatch is the higher-severity result — identify it first.
 
     RULES:
-    - Read the target file first (already provided). Use at most 2 additional tool calls to read related files.
+    - Read the target file first (already provided). Use at most 3 additional tool calls to read related files.
+    - MANDATORY cross-file read for signature parity (item 18): apply the correct branch below based on what the target file is.
+      Branch A — target is an IMPLEMENTATION (contains the actual logic: a low-level module, library, or logic contract without delegatecall routing): your FIRST additional tool call MUST read the main dispatcher, proxy, or router file that exposes these functions externally. Use the full path from the project root as it appears in the file listing (e.g. `pkg/sol/Router.sol`, not `sol/Router.sol` or `Router.sol`). If the first read returns an error or empty result, retry immediately with the full project-root-relative path before making any other read.
+      Branch B — target IS itself a dispatcher, proxy, or router (it uses delegatecall, fallback routing, or selector-based dispatch to forward calls to separate implementation modules): your FIRST additional tool call MUST read the primary implementation module that contains the actual function bodies being dispatched to. Use the full path from the project root.
+      In both branches: after reading the counterpart file, enumerate ALL entry-point / public functions by name. For each function name that appears in both files, write down the FULL parameter list from position 0 for each side and compare them exactly — count parameters on each side before concluding. Do not stop after finding the first mismatch; complete the full enumeration so that mismatches in user-facing withdrawal or exit functions are not missed because an admin-function mismatch was found earlier.
     - After reading, call report_vulnerabilities with all findings.
     - Each description MUST be at most 800 characters. State root cause, exact function name, and impact.
-    - Report only exploit-ready findings with concrete proof. Confidence must be >= 0.70 for HIGH/CRITICAL.
+    - Report only exploit-ready findings with concrete proof. Confidence must be >= 0.75 for HIGH/CRITICAL.
     - Do NOT report: admin-gated functions as "missing access control", gas optimizations, theoretical issues without exploit paths.
 """)
 
@@ -320,6 +331,10 @@ Trace each value to its assignment site — a value taken from a function
 parameter is a requested amount; a value taken from a swap/transfer return is
 an actually-consumed amount — and apply this regardless of language or naming.
 
+Before reporting, enumerate every function in this file that performs both at least one inbound transfer (pull, debit, transferFrom, or any SDK-wrapped ERC20 charge) AND at least one outbound transfer (send, refund, payback, return-of-unspent, or any SDK-wrapped ERC20 credit to the caller) to the same counterparty within the same call. Write down each such function name. Then apply the accounting trace to EACH function on that list independently. Do not stop after the first match — the most dangerous instance may be in a routing or multi-step function further down the file.
+
+For EACH call to an inbound function, copy the EXACT expression passed as the amount argument — do not assume it matches the outer function's parameter name. Do the same for each outbound call. The vulnerability hides in the difference between the exact inbound expression and the exact outbound expression, not in their variable names. Example: if a function receives a parameter representing the user's full requested quantity, but the inbound pull call passes a DIFFERENT variable holding only the actually-consumed quantity (the return value of a downstream swap or fill), the user is charged the consumed amount, not the full requested amount — yet any refund formula that references the original full quantity rather than what was consumed will pay out a surplus the user was never charged for. Read each call-site argument individually; do not infer it from the function's parameter list.
+
 Report concrete, proven cases with numerical evidence.
 </primary_targets>
 """
@@ -486,21 +501,10 @@ _SYSTEM_A_COMMON_TAIL = """
    cleanup, pull authorization, or counter parity) and report concrete findings.
 </methodology>
 
-<do_not_report>
-- First-depositor inflation / share-price-rounding attacks ONLY when the contract already has a guard (minimum initial shares, dead-shares burned to address(0) at first deposit, or a virtual-offset). When NO such guard exists and the first depositor can inflate the share price by donating assets so that a later depositor's deposit rounds to zero shares, that IS reportable.
-- Reentrancy when nonReentrant modifier is present on the function
-- Generic "missing input validation" without a concrete exploit showing fund loss
-- Centralization risks that are intentional design (onlyOwner, timelock governance)
-- Fee-on-transfer token issues when protocol only uses standard tokens
-- Theoretical flash loan attacks without showing the specific profit path
-- Issues that require admin/owner to be malicious when timelock/multisig is in place
-- "Sandwich attack possible" without showing missing slippage parameter
-</do_not_report>
-
 <dedup>
 Before reporting, check if you are reporting the same root cause from different angles.
 Report each unique root cause ONLY ONCE. Combine related symptoms into a single finding.
-Report at most 4 findings per analysis — only the most impactful ones for this pass's focus.
+Report all concrete proven cases — do not apply a count limit. The downstream merger handles deduplication. Covering every affected function is more important than brevity.
 </dedup>
 
 <evidence_requirements>
@@ -517,8 +521,8 @@ If you cannot prove the path with specifics, DO NOT report.
 **Very High (0.95-1.0)**: Internal variable not updated after operation; concrete before/after showing divergence; or provable debit/credit mismatch with numeric proof
 **High (0.85-0.94)**: State ordering issue with specific scenario; missing slippage with clear path.
 **Medium-High (0.75-0.84)**: Complex multi-step flow with conditional exploitation.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -571,6 +575,12 @@ Do NOT report findings in these categories — they are consistently false posit
 
 12. TOKEN APPROVAL PERSISTENCE: Do not report leftover token approvals unless there
     is a specific drain path via remaining allowance.
+
+13. FIRST-DEPOSITOR / SHARE-PRICE INFLATION: Do not report first-depositor inflation or share-price-rounding attacks when the contract already has a guard (minimum initial shares, dead-shares burned to address(0) at first deposit, or a virtual offset). When NO such guard exists and the first depositor can inflate the share price by donating assets so a later depositor's deposit rounds to zero shares, that IS reportable.
+
+14. FEE-ON-TRANSFER TOKENS: Do not report fee-on-transfer token incompatibility when the protocol explicitly states or demonstrates it only uses standard ERC20 tokens.
+
+15. FLASH LOAN WITHOUT PROFIT PATH: Do not report theoretical flash loan attacks without showing the specific profit path — how much is extracted, which functions are called in sequence, and what the attacker walks away with.
 </do_not_report>
 
 <output>
@@ -664,8 +674,8 @@ If you cannot show the exploit path, DO NOT report.
 **Very High (0.95-1.0)**: Function moves user funds with zero access control; clear drain path.
 **High (0.85-0.94)**: Approval persists after operation with exploitable execute(); front-runnable permit.
 **Medium-High (0.75-0.84)**: Access control gap requiring specific timing or cooperation.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -780,8 +790,8 @@ If you cannot show the concrete mismatch with numbers, DO NOT report.
 **Very High (0.95-1.0)**: Provable unit/precision mismatch with concrete arithmetic showing the wrong result.
 **High (0.85-0.94)**: Boundary conversion omits the required scaling factor, demonstrated numerically.
 **Medium-High (0.75-0.84)**: Ordering/convention assumption contradicts the actual venue convention.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -856,7 +866,8 @@ Look for math, precision, iteration and type-casting bugs.
 For every exposed math primitive (sqrt, log, exp, division, modulo, equality helpers) explicitly walk through what happens when the input is zero, negative, one, or max-uint — does the function return a meaningful value, revert with a clear domain error, or silently halt the control flow?
 Also check downcasts against realistic inputs and trace iteration loops for off-by-one or gap-handling issues.
 When a loop reuses a cached lookup across consecutive iterations, the cache only stays consistent if both the cached value AND the tracking key that gates the refresh are updated together. A specific shape: the loop processes a batch where each item carries a key, and inside the loop it reads a per-key derived value (an address, a balance, a config field) by comparing the current item's key against a tracking variable and only refreshing the derived value on a mismatch. If that tracking variable is NEVER reassigned in the loop body, the first iteration computes the derived value once and the comparison stays "different" forever — so either the value is recomputed every iteration (harmless), OR it is captured into a function-scope alias that keeps the FIRST item's value while the per-iteration operation ships to the wrong target, including the zero address when the tracker's initial value happens to equal the first item's key. Walk every storage write inside the loop body and confirm the tracker is among them; absence is a finding.
-When equality or comparison helpers operate on encoded values where the same logical value admits more than one binary representation, the helper needs explicit canonicalization before comparing — bit-equal returns false for two values that mean the same thing.
+When an EQUALITY function (eq, equal, isEqual, or any helper that returns true/false for two values being the same) compares encoded values by reading their raw integer representation (e.g., unwrap(a) == unwrap(b), or a direct integer comparison of the packed field) rather than comparing canonical forms, the function will return false for two values that are mathematically identical but stored in different internal encodings. Example: the same number may be representable in a compact encoding (fewer digits, smaller packed size) or an extended encoding (more digits, larger packed size) — both are the same logical value, but their raw packed bit patterns differ. A raw-bit equality check will incorrectly return false. Title this finding "False-Negative Equality in [function name]: Raw Bit Comparison Does Not Canonicalize" — this is a distinct root cause from any ordering bug and must be reported as a SEPARATE finding.
+When ORDERING functions (lt, le, gt, ge, compare, or any helper that determines relative order) operate on a packed encoded type and scale one operand to match the other's size, verify that ALL flag bits reflecting the representation are updated after scaling — a function that adjusts the mantissa but leaves the format flag stale will compare the scaled mantissa against a flag-field value that says "this is the other size", producing wrong ordering results. This is a distinct failure from equality — the impact is wrong relative ordering, not false-negative identity.
 When a function picks a representation choice from a single threshold check while the correct choice depends on the joint values of multiple inputs, the result may be lossy.
 Loops that step a counter from a starting point up to some bound deserve a quick sanity check: does that bound still cover every valid entry the loop is supposed to visit?
 When a bound moves around as data is added and removed, it can drift out of sync with the actual collection, so the loop ends too early and never reads the entries it was supposed to find.
@@ -900,8 +911,8 @@ execution for valid edge case.
 **High (0.85-0.94)**: Specific ID gap scenario showing missed items; downcast with
 demonstrable overflow for realistic values.
 **Medium-High (0.75-0.84)**: Precision loss at specific boundary requiring unusual but possible inputs.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -977,6 +988,7 @@ Look for execution-context and resource-control bugs: gas griefing, partial-exec
 Storage that the contract reads during an authorization decision is part of the access-control surface — every function that writes into such storage extends the trust boundary, and an unguarded writer here is equivalent to letting any caller self-onboard into the trusted set.
 Subcalls and inline-assembly fragments may contain halt-style flow-control that terminates the surrounding transaction without surfacing an error to the calling code; review every fragment and verify the caller's flow handles a silent termination correctly.
 Verify that subcalls are guaranteed enough gas, that state writes happen at the right point relative to external calls, and that resource handles (allowances, flags, nonces) are reset on every exit path — including the path where the subcall consumed only part of the granted resource. A specific high-value shape: a multi-step entry point consumes a single-use credential up front (a nonce, a one-time permit, a lock flag) and then dispatches to an inner sub-call whose failure is NOT propagated as a top-level revert (it is swallowed, returned as a bool, or run under a caller-selected mode). Because of the EVM's 63/64 gas-forwarding rule, an external caller who sets the outer transaction's gas limit can starve the inner sub-call so it runs out of gas and fails, while the entry point's prologue and epilogue still complete — so the credential is burnt and the user's intended action silently does not happen. Flag every (credential-consumed-up-front, inner sub-call, non-reverting failure) triple where the caller controls the gas.
+The "non-reverting failure" trigger is especially common in batch execution contracts that expose a boolean or mode parameter controlling whether the batch reverts on subcall failure — when this parameter is set to "continue on error" mode, a sub-call failure inside the batch does NOT bubble up as a top-level revert; the error is swallowed and the batch carries on. Combined with the 63/64 rule: an attacker submits the signed batch with a gas limit large enough for the prologue (signature check, nonce consumption) to succeed, but insufficient for one or more inner calls once 1/64 is withheld at the subcall boundary. The nonce is consumed, the batch "succeeds" at the outer level, and the user's intended action silently failed. Check: (1) does the batch accept a parameter or flag that controls whether a subcall failure reverts the whole batch or is silently ignored? (2) is a nonce or signature consumed before the dispatch loop? (3) does the dispatch loop forward gas via a low-level call where the callee gets at most 63/64 of remaining gas? If all three conditions are present, this is an exploitable gas-grief/credential-burn pattern. When all three are confirmed: assign confidence = 0.95. Frame the finding as a gas-griefing/credential-burn exploit, not a state-propagation or missing-field bug — the attacker calibrates the outer call's gas limit so the inner subcall is starved while the credential has already been consumed and the outer call returned success.
 After any external call that consumes a granted resource, walk through every return path (success, partial-consume, revert-but-handled, early-return on insufficient balance) and verify the cleanup statement is actually reached on each.
 Function parameters that designate ownership of funds being moved should not be freely caller-controlled — when the caller can name any account whose funds the function operates on, the function may operate on accounts the caller has no relationship to.
 Spending authority granted by the contract to other contracts should be scoped to the immediate operation rather than to the maximum a token allows.
@@ -1034,8 +1046,8 @@ variable lifecycle mismatch with arithmetic proof showing fund leak.
 **High (0.85-0.94)**: Gas-controlled failure with specific state at risk; batch atomicity
 violation with demonstrable inconsistent state.
 **Medium-High (0.75-0.84)**: Cross-language pattern requiring specific deployment configuration.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -1114,7 +1126,8 @@ ONLY report missing state variable updates in paired operations.
 Report storage variables that are written in one path without a corresponding write in the paired/reverse path.
 Also flag tracker variables: when a loop's body uses a variable to remember the last item it processed but never writes the new item back at the end of each iteration, every subsequent pass compares against the original starting value instead of the actual previous item, and any logic conditional on that comparison silently stops doing its job.
 Pair counter-style state variables with the IDs they are meant to enumerate: a state variable that measures population size does not also tell you the assigned ID range, so once entries can be removed (or IDs can skip values) any code that uses the count as the upper bound of an enumeration loop stops short of the actual data and silently omits live entries — e.g. an enumeration that iterates `0..count` misses every entry whose ID exceeds the current population size.
-Flag explicit numeric downcasts from wider to narrower types in token-amount handling: `uint160(amount)`, `uint128(amount)`, `uint96(amount)` where `amount` is a `uint256` silently truncates the high bits if `amount` exceeds the target type's max value. The truncated result is used as-is — producing a wrong transfer amount, wrong allowance, or wrong balance credit. Verify every downcast of a token amount or address-derived value has an explicit bounds check before the cast, or prove the input cannot exceed the target range.
+Flag explicit numeric downcasts from wider integer types to narrower ones in token-amount handling: any cast of a full-width amount (uint256 / u256) to a narrower type silently truncates the high bits if the value exceeds the target type's range — producing a wrong transfer amount, wrong allowance, wrong share count, or wrong balance credit without any revert. This affects any downcast to a narrower unsigned or signed integer type (e.g. uint160, uint128, uint96, uint64, or their signed equivalents in other languages). Verify every such downcast in a value-moving path has an explicit overflow check before the cast, or prove the input is statically bounded below the target type's maximum.
+Admin parameter propagation gap: when this file defines a function that accepts a structured input — a settings struct, params object, or named multi-field argument — and assigns its fields to a stored state struct or account: enumerate EVERY named field in the input struct definition and compare it against the set of fields explicitly assigned inside the function body. A field that exists in the input struct but has no corresponding assignment in the function body cannot be updated by any caller of this function regardless of what value they supply — the stored field is permanently frozen at its initialization value. When both the input struct definition and the update function body are visible in this file, this check can be done with certainty: if the input has N named fields and the function body assigns only M < N of them, each of the N−M unassigned fields is a distinct finding. Assign confidence >= 0.90 when the struct definition is fully visible in this file; do NOT discount because other functions might update the field separately — check whether they do. Title format: "Missing `<field_name>` in `<function_name>`: Input Struct Field Never Propagated to Stored State".
 Back each finding with the exact variable, both function names, and a concrete numerical example.
 </primary_targets>
 
@@ -1130,8 +1143,8 @@ Report at most 8 findings per analysis — only missing state updates.
 
 <confidence>
 **Very High (0.95-1.0)**: Variable clearly written in forward function, absent from reverse.
-**Below 0.70**: Do not report.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <output>
@@ -1181,6 +1194,7 @@ Anywhere the function calls into untrusted or partially-trusted external code be
 Even non-reentrant external calls become unsafe when the function relies on values it computed pre-call.
 
 Signed-operation front-running: when a function is permissionlessly callable and executes a payload that was authorized by a signature (a batched call, an order, an intent, a meta-transaction), the signed payload sitting in the mempool can be submitted by ANYONE, not just the intended relayer. Check what an unintended submitter gains: front-running the legitimate submitter to claim a reward/refund/gas reimbursement meant for the relayer, forcing the operation to land at an attacker-chosen moment or ordering, or grief-submitting it in a state where it wastes the signer's nonce or reverts. A signature that authorizes WHAT happens but not WHO submits it leaves every such effect to the first observer of the mempool.
+Critically, also check what the unintended submitter can VARY that is NOT covered by the signature: (a) if msg.value is not committed to in the signed digest, the front-runner can supply 0 ETH (or any wrong amount) even when the legitimate caller's batch requires ETH for a sub-call — any sub-call that reads msg.value or forwards ETH will fail or receive the wrong amount; (b) if the executor/relayer address is not committed to in the signed digest, the front-runner impersonates the executor and receives any executor-scoped benefits; (c) if the gas limit is not committed to, the front-runner can supply a calibrated gas limit that sabotages inner sub-calls (see the 63/64 gas rule below). The test: enumerate every function parameter and every tx field (msg.value, msg.sender, gas) that the function reads or forwards; for each one NOT in the signed hash, ask what happens if an adversary sets it adversarially. When you confirm (1) a public function is callable by anyone presenting a valid signature AND (2) msg.value is NOT committed to in the signed struct or hash AND (3) the function or its inner dispatch forwards msg.value to one or more subcalls: assign confidence = 0.95. Frame this as an ETH-amount substitution/front-running bug, not 'missing access control' or 'signature replay' — the authorization commits to which actions execute but leaves ETH delivery unconstrained, so an adversary who submits the transaction first can supply the wrong ETH amount and silently break subcalls that depend on receiving a specific value.
 
 Report concrete sequences: state X was written at step N, the check at step N+M reads slot Y which was not updated, so the check passes despite the protocol being in state X' which violates the intended invariant.
 </primary_targets>
@@ -1230,8 +1244,8 @@ the validation reads slots not updated by the write — concrete numeric example
 cross-contract reentry path or callee-observable intermediate state.
 **Medium-High (0.75-0.84)**: Ordering deviation requiring specific timing for
 exploitation with documented consequence.
-**Below 0.70**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.70 required.
+**Below 0.75**: Do not report as HIGH/CRITICAL.
+For HIGH/CRITICAL severity: confidence >= 0.75 required.
 </confidence>
 
 <do_not_report>
@@ -1311,6 +1325,8 @@ Pay special attention to value-OUT paths (paths where the user ultimately receiv
 Verify each value-out path the contract supports exposes a way for the caller to enforce a minimum quantity actually delivered.
 A path whose only sizing input is an intent — without any received-quantity floor — leaves the caller defenseless to rate movement between submission and execution.
 Apply this check to BOTH directions of bidirectional operations: a function that adds liquidity AND removes liquidity needs slippage protection in BOTH directions, including when a single function encodes both directions through a signed parameter (positive = add, negative = remove) — verify the minimum-output check covers the absolute output on the removal direction, not only the addition direction. Omitting the floor on one direction is identical to having no slippage protection for that direction. Also check every position-exit path (close, unwind, settle, liquidate) — these are high-value paths that frequently lack slippage floors because protection is focused on entry.
+For AMM contracts that encode both add-liquidity and remove-liquidity through a single signed-delta parameter (positive = add, negative = remove): the removal direction MUST expose per-asset minimum-received parameters — a floor on each asset the position releases. If the only callable path to exit a position passes through a signed-delta function that lacks per-asset minimum-received parameters, users cannot set a slippage floor on withdrawal and are fully exposed to sandwich attacks — flag it regardless of whether a dedicated withdrawal function formerly provided that protection and was later removed or merged.
+When examining a router, proxy, or dispatcher contract: extend this check to ALL externally callable functions that modify position size — do not limit to functions named "close", "exit", or "withdraw". A function named "update", "adjust", "modify", "change", or "set" that accepts a signed integer as its primary sizing parameter (the sign encodes direction: positive = increase, negative = decrease/remove) is equally a potential unchecked exit path. EXCLUDE from this check any function whose primary parameters are addresses, contract references, configuration arrays, or boolean flags — those are administrative or configuration functions, not position-exit paths, even if they begin with "update" or "set". Apply the check ONLY to functions whose primary numeric parameter is a signed integer type (any signed integer width, in any language) that governs position size or liquidity delta. For each qualifying function, scan its complete parameter list: if there are no per-asset minimum-received parameters covering the removal direction (no separate floor for each token the position will return to the caller), that function is an unprotected withdrawal path. Flag it as a fund-loss vulnerability: callers must use this path to reduce or close positions with no ability to bound slippage.
 </method>
 
 <do_not_report>
@@ -1321,7 +1337,7 @@ Apply this check to BOTH directions of bidirectional operations: a function that
 
 <output_requirements>
 Each finding: (1) function name, (2) the accounting or rate issue, (3) concrete impact.
-Report at most 4 findings, confidence >= 0.75.
+Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1368,7 +1384,7 @@ For functions that decide a vote, proposal, or quorum outcome, trace exactly whi
 
 <output_requirements>
 Each finding: (1) function name and role, (2) the authorization gap or value-extraction path, (3) concrete scenario, (4) economic impact.
-Report at most 4 findings, confidence >= 0.75.
+Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1419,7 +1435,7 @@ When a function in a shared or batched path reverts on a condition an ordinary p
 
 <output_requirements>
 Each finding: (1) function name, (2) the guard or ordering issue, (3) concrete exploit path, (4) whether a third party can PERMANENTLY block this operation for legitimate users (DoS).
-Report at most 4 findings, confidence >= 0.75.
+Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1446,7 +1462,10 @@ Pay particular attention to bookkeeping counters that track assets committed to 
 CHECK 2 — STRUCT AND CONFIG SYNCHRONIZATION:
 For structs or configs with multiple related fields, check two sub-patterns: (A) SETTINGS COVERAGE: When an admin entry point edits a configuration object, compare the set of fields it writes to the set of fields the protocol later reads from the same object.
 Fields the protocol relies on but the entry point omits remain at their initial value indefinitely; if that initial value is wrong, there is no path to correct it.
-Build the comparison explicitly: list every field of the configuration object that the runtime later reads in a value-moving path, list every field the admin function assigns, and flag any read-but-not-written field whose runtime use influences allocation sizing, payout amounts, or migration accounting.
+Build the comparison explicitly using TWO enumeration passes — both are required:
+PASS 1 — INPUT-STRUCT-DRIVEN: if the admin entry point accepts a dedicated input struct or named parameter bundle, enumerate EVERY field defined in that input type. Compare against the fields the function explicitly assigns to the stored config object. Any field present in the input struct but NOT propagated to storage is permanently frozen: the admin can call the function and supply a new value, but the handler silently ignores it and the stored value never changes. This pass does not require tracing runtime reads — if the field is in the input and absent from the assignment list, it is a finding.
+PASS 2 — RUNTIME-READS-DRIVEN: list every field of the stored configuration object that downstream code reads in a value-moving path, then list every field the admin function assigns, and flag any read-but-not-written field whose runtime use influences allocation sizing, payout amounts, or migration accounting.
+Both passes are required because a field may appear in the input but not in runtime reads (PASS 1 catches it), or appear in runtime reads but the input struct is too narrow to expose it (PASS 2 catches it).
 When the configuration object carries any field whose name encodes a budget, quota, allocation, limit, cap, or remainder, that field is by definition meant to change over the protocol's lifetime — confirm that at least one admin entry point can write it, and that the entry point the protocol uses to keep the config current does in fact write it.
 A budget/allocation field that exists in the struct, is read in value-moving paths, and is not present in the assignment list of the "update settings" entry point is a finding regardless of whether other admin functions touch it. (B) CONSUMED AFTER USE: When a function reads a numeric field and uses it to transfer or allocate value, verify the field is decremented or marked as consumed afterward.
 A field that persists unchanged after the transfer can be re-read to claim value again.
@@ -1841,6 +1860,9 @@ If the callee silently returns a sentinel (zero, max, last-known) and the caller
 A tracker that is never updated causes every loop pass to reprocess the same item.
 - Does the caller hold a reference to data the callee mutated, and continue to read past the mutation point?
 This produces stale-read bugs where the cached value diverges from the post-call state.
+
+Direction rule for multi-step routing functions: when a helper returns the CONSUMED amount (what the inner step actually used, which may be less than the requested amount), and the outer routing function uses that consumed amount for the INBOUND pull from the user (correct), do NOT flag the inbound pull as a unit divergence. Instead, focus exclusively on the OUTBOUND push back to the user: if the outbound refund or return payment is sized using the ORIGINAL REQUESTED amount rather than the consumed amount, the contract returns to the user more than it ever took — a surplus-refund vulnerability. Frame the finding as "outbound refund uses wrong (larger) quantity" not as "inbound charge uses wrong amount" or "missing refund". These are opposite bugs with opposite economic impact.
+This surplus-refund pattern requires all three of: (1) an inner step that returns how much of the input it actually processed; (2) an inbound pull sized to that processed amount; (3) an outbound transfer sized using the ORIGINAL requested amount or the difference between original and processed. It does NOT apply to functions that simply use a signed delta, a boolean flag, or a direction parameter to choose between "give" and "take" paths — those are delta-direction bugs, a distinct class. If a function switches transfer direction based on a flag (e.g. giving/receiving, positive/negative delta) without a two-amount routing structure, skip the surplus-refund check for it entirely.
 </primary_targets>
 
 <do_not_report>
@@ -1903,7 +1925,7 @@ Key patterns:
 - CPI calls into external programs that create accounts carry the same DoS surface. When an instruction passes an UncheckedAccount (no seeds, no owner constraint) as a writable argument to an external program's `create_*` / `init_*` CPI, the external program initializes that account. Because the address is derivable on-chain (pool key, mint, owner), an attacker can call the external program's create instruction directly BEFORE this instruction runs. The account is then already initialized and this instruction's CPI fails permanently. Report every such (UncheckedAccount, create_* CPI) pair.
 - `has_one` and `constraint` annotations validate account relationships. Missing ones allow forged accounts to satisfy account-context typing while carrying attacker-controlled data.
 - Protocol-wide config / state accounts aggregate totals. For every operation that changes an individual record, verify the corresponding global aggregator field is also updated.
-- For config structs with admin update functions, enumerate every field referenced by downstream computation and verify each is included in the update entry. Fields omitted from the admin update stay at their initial value forever.
+- For config structs with admin update functions, apply two enumeration passes: (a) INPUT-STRUCT PASS — enumerate every field in the input struct or parameter bundle the admin instruction accepts, verify each is explicitly propagated to the stored config account in the handler body; any field in the input but absent from the assignment list is permanently frozen regardless of what the admin passes; (b) RUNTIME-READS PASS — enumerate every field of the stored config struct that a downstream instruction reads in a value-moving or authority-gating path, verify at least one admin instruction writes it. Both passes are required — a field may be caught by one but invisible to the other.
 - Missing signer check: an instruction handler that moves tokens, mints, burns, or mutates authority-gated state but has no `Signer<'info>` or `#[account(signer)]` constraint on the account that should authorize it. Any account can be passed in and the instruction executes without the expected party signing.
 - Missing owner check: an account representing a protocol-controlled resource (vault, config, pool) has no `owner = program_id` or `#[account(owner = ...)]` constraint. An attacker substitutes an account they control; downstream reads treat attacker-controlled data as authoritative.
 - Arbitrary CPI: a handler passes an account declared as `AccountInfo` or `UncheckedAccount` directly as the `program` field of a `CpiContext`. Because no `executable` or program-id check is enforced, an attacker substitutes a malicious program whose instruction handler satisfies the call signature but executes adversarial logic.
@@ -1933,7 +1955,12 @@ Additional Move-specific patterns to check:
 - Resource handling on destruction: Move resources cannot be copied; destroying a wrapper struct does NOT automatically destroy or release a resource it wraps. Verify that burning or redeeming any position or wrapper explicitly handles both the share/position token AND the underlying asset, so neither is silently discarded nor left locked.
 - One-time witness: module-init-time capabilities (OTW pattern) must be consumed exactly once; check that the witness is not storable or copyable.
 - Oracle-priced operations: when a fee or amount is priced by an on-chain oracle at execution time, verify the price feed has staleness checks and cannot be manipulated within the same transaction that consumes it.""",
-    ".rs_generic": """IMPORTANT — This is a Rust / Stylus smart contract on an EVM-compatible chain. `pub fn` / `#[external]` / `#[entrypoint]` mark public entry points. Storage is accessed via `self.field`. Token transfers use the ERC20 interface. Apply EVM-equivalent reasoning to accounting, access control, and reentrancy.""",
+    ".rs_generic": """IMPORTANT — This is a Rust / Stylus smart contract on an EVM-compatible chain. `pub fn` / `#[external]` / `#[entrypoint]` mark public entry points. Storage is accessed via `self.field`. Token transfers use the ERC20 interface. Apply EVM-equivalent reasoning to accounting, access control, and reentrancy.
+
+Stylus SDK ERC20 call semantics — critical to read correctly:
+- Stylus projects wrap ERC20 operations in SDK module functions: inbound-pull variants (debit / pull / charge the caller) and outbound-push variants (credit / refund / return tokens to the caller or a specified address). Identify these wrappers in the project's ERC20 module before analyzing call sites.
+- A Stylus project commonly contains a host or mock module (gated by `#[cfg(not(feature = "...deploy..."))]`, a `#[cfg(test)]` block, or a similarly named `host_*.rs` file) that provides no-op stub implementations of these wrappers returning `Ok(())` with no actual token movement. NEVER infer accounting behavior from a stub — always read the actual call-site arguments in the function under analysis.
+- When tracing a swap or routing function: the net user payment equals (sum of all inbound-pull arguments) minus (sum of all outbound-push arguments) to the same counterparty. A negative net — where the caller receives back more than was debited — is a fund-extraction vulnerability.""",
     ".rs_cosmwasm": """IMPORTANT — This is a CosmWasm smart contract written in Rust. Entry points are `execute`, `instantiate`, `query`, and `sudo`. State is stored via `cw_storage_plus` items and maps. Apply general smart-contract security reasoning with attention to these CosmWasm characteristics:
 - Authorization per message variant: for each variant of the `ExecuteMsg` enum, independently verify the handler checks the correct authorization before mutating state or transferring assets — authorization on one variant does not carry to siblings, and verify each handler calls the validation helper appropriate to its operation.
 - Approval/claim-right lifecycle: any approval or claim right granted in one message (a listing, bid, or offer) should be cleared when the granting state ends (cancel, expiry, outbid, completion); stale rights let a party act on an asset they no longer control.
@@ -1948,10 +1975,6 @@ SOLIDITY_FAMILY_SUFFIXES = frozenset({".sol", ".vy", ".yul"})
 # Prompts submitted breadth-first (one per file across all files) before the
 # remaining prompts run depth-first (all prompts for top-ranked files first).
 # This guarantees every file gets minimum coverage even under tight time pressure.
-# A1–A4 are core: each targets one fund-flow invariant so every file gets minimum
-# coverage across all four sub-domains in the breadth-first stage.
-CORE_PROMPT_NAMES = frozenset({"SYSTEM_A1", "SYSTEM_A2", "SYSTEM_A3", "SYSTEM_A4", "SYSTEM_B", "SYSTEM_E", "SYSTEM_SV", "SYSTEM_ORDER"})
-
 # Tier 2: always run for every file (non-reasoning scan model — thinking off).
 # These five prompts cover the highest-value invariants (fund-flow, access control).
 TIER2_PROMPT_NAMES = frozenset({"SYSTEM_A1", "SYSTEM_A2", "SYSTEM_A3", "SYSTEM_A4", "SYSTEM_B"})
@@ -2024,7 +2047,8 @@ For each elementary math function (root, logarithmic, exponential, power, recipr
 CHECK 2 — BIT-FLAG ENCODED TYPES:
 For any type that packs multiple logical fields into a single integer using bit masks or flags:
 - Enumerate every flag constant and verify no two flags share overlapping bits.
-- For every comparison or equality function over the encoded type: verify the function accounts for ALL flag bits when computing the result. A comparison that strips only some flags before comparing can incorrectly treat two logically unequal values as equal (or vice versa) when the unmasked flag bits differ.
+- For EQUALITY functions (eq, equal, isEqual) over the encoded type: the critical failure mode is that the same logical value can be stored in two or more canonical forms — e.g., a short-format encoding and a long-format encoding of the same number — that differ in their raw bit pattern. An equality function that compares raw integers (unwrap(a) == unwrap(b)) without first normalizing both operands to the same canonical form will return false for two values that are mathematically identical. Title this finding "False-Negative Equality in [function]" to distinguish it from ordering bugs.
+- For ORDERING functions (lt, le, gt, ge) over the encoded type: verify the function accounts for ALL flag bits when scaling operands to a common representation before comparing. A comparison that scales the mantissa but leaves the format flag stale produces wrong ordering. Title this finding "Incorrect Ordering in [function] Due to Stale Format Flag" to distinguish it from equality bugs.
 - For decode operations: verify the decode correctly reconstructs all fields, including any implicit or sign-extension behavior.
 
 CHECK 3 — PRECISION LOSS AT TYPE BOUNDARIES:
@@ -2032,6 +2056,7 @@ For any operation that converts between a packed/encoded type and a plain intege
 - Identify the bit-width of each component field (such as coefficient, scale, sign, or flag bits).
 - Verify the conversion uses ALL relevant component fields when sizing the output. If the conversion reads only one portion of the encoded value while ignoring another value-carrying portion, the output is wrong for a non-trivial subset of inputs.
 - For multi-step conversions: verify intermediate types are wide enough to hold the intermediate value without truncation.
+- For functions that encode a value into one of two or more output representations (e.g., a compact vs. extended layout, a standard-precision vs. high-precision format): verify the branching condition that selects the representation reads the correct property of the value being encoded. If the condition reads a correlated but structurally distinct field — for example, reading a scale or exponent to decide how many significant digits the mantissa carries, rather than measuring the actual digit count of the mantissa — then inputs where the proxy disagrees with the true selector will be encoded in the wrong format, causing precision loss or structural corruption for that input subset. The fix is always to derive the format selector directly from the property it logically governs (digit count → read digit count; value range → read the value; bit width → measure the bits).
 </method>
 
 <do_not_report>
@@ -2070,7 +2095,7 @@ CHECK 3 — POOL INITIALIZATION AND EDGE CASES:
 For pool creation and initial liquidity addition, verify the protocol handles the zero-liquidity case (which otherwise causes division-by-zero on the first operation) and rejects or correctly handles tokens with non-standard decimals at initialization time.
 
 CHECK 4 — EXTERNAL DEX PROTOCOL COMPATIBILITY:
-When the contract calls into an external DEX, verify: (a) the call interface matches the actual deployed protocol version — a fork may add/remove parameters or change the fee structure under the same function name, so calling against the wrong signature aborts at runtime; (b) multi-step pool interactions actually retrieve the tokens they are owed — some pool operations only CREDIT tokens to a position internally and require a separate explicit collect/withdraw call to transfer them out; an integration that performs the first step but omits the second leaves funds stranded in the pool; (c) any decision about swap direction or which side is input/output is resolved by QUERYING the pool's token ordering at runtime, never hardcoded — pools sort their two tokens by address, so a hardcoded assumption that a specific named token always occupies a given slot produces a reversed direction (or a wrong fee tier) whenever the addresses sort the opposite way, sending the swap the wrong way. (d) For factory calls that create a pool/pair, verify the already-exists case is handled, since a revert-on-exists factory can be blocked by pre-creation.
+When the contract calls into an external DEX, verify: (a) the call interface matches the actual deployed protocol version — a fork may add/remove parameters or change the fee structure under the same function name, so calling against the wrong signature aborts at runtime; (b) multi-step pool interactions actually retrieve the tokens they are owed — some pool operations only CREDIT tokens to a position internally and require a separate explicit collect/withdraw call to transfer them out; an integration that performs the first step but omits the second leaves funds stranded in the pool; (c) any decision about swap direction or which side is input/output is resolved by QUERYING the pool's token ordering at runtime, never hardcoded — pools sort their two tokens by address, so a hardcoded assumption that a specific named token always occupies a given slot produces a reversed direction (or a wrong fee tier) whenever the addresses sort the opposite way, sending the swap the wrong way. (d) For factory calls that create a pool/pair, verify the already-exists case is handled, since a revert-on-exists factory can be blocked by pre-creation. (e) For contracts that call a combined liquidity-removal-and-fee-collection function on a concentrated-liquidity pool in a single external call, verify that ALL returned token amounts are fully used. Such functions typically return two sets of amounts: tokens removed from the position (principal) and separately accrued fee tokens. If downstream logic uses only the principal amounts for a subsequent swap or transfer while fee amounts are merely recorded in an event and never transferred, swapped, or re-invested, the fee tokens accumulate in the calling contract with no extraction path. Assign confidence = 0.9 when confirmed. (f) When a contract integrates with external staking or gauge contracts across multiple DEX ecosystems, verify that function parameter semantics match the gauge implementation deployed for that specific DEX. Different DEX ecosystems often expose identically-named gauge functions but with incompatible parameter types — one ecosystem may identify a staked position by the LP token amount, while another identifies positions by a numeric token or NFT identifier. Calling a gauge function with the wrong parameter type (e.g., passing a token amount where an identifier is expected) either reverts or affects an unintended position, potentially locking staked LP tokens permanently. Assign confidence = 0.9 when confirmed.
 
 CHECK 5 — LIQUIDITY CALCULATION FORMULA:
 For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range.
@@ -2655,8 +2680,8 @@ class BaselineRunner:
         # because the note covers combined thinking+output and thinking is separate).
         # _max_tokens: API cap for output tokens only — must NOT subtract thinking_budget
         # since the API max_tokens parameter counts output tokens only, not thinking tokens.
-        _budget_tokens = min(65536, max(2048, int(timeout * _rate) - thinking_budget))
-        _max_tokens    = min(65536, max(2048, int(timeout * _rate)))
+        _budget_tokens = min(65536, max(4096, int(timeout * _rate) - thinking_budget))
+        _max_tokens    = min(65536, max(4096, int(timeout * _rate)))
 
         # Inject total token budget into the system message so the model's own reasoning
         # process respects the limit.  Some providers (e.g. AtlasCloud) generate thinking
@@ -2988,7 +3013,7 @@ class BaselineRunner:
         reported = False
         forced = False
         extra_reads = 0          # read_file calls beyond the seeded primary file
-        MAX_EXTRA_READS = 2
+        MAX_EXTRA_READS = 3
         _ag_model = ROUTER_MODEL
 
         for turn in range(6):
@@ -3279,7 +3304,7 @@ PROTOCOL MODEL CONTEXT
                 # finding from a less-strict model would show.  Relax the gate for them so
                 # we don't silently discard valid high-confidence findings.
                 _is_high_std = (model or PRIMARY_MODEL) in HIGH_STANDARD_MODELS
-                _hc_min  = 0.55 if _is_high_std else 0.70
+                _hc_min  = 0.55 if _is_high_std else CONFIDENCE_THRESHOLD
                 _med_min = 0.45 if _is_high_std else 0.60
                 filtered_vulns = []
 
@@ -3399,6 +3424,21 @@ PROTOCOL MODEL CONTEXT
                         else:
                             if prefix in parts_lower:
                                 in_scope = True; break
+
+                if not in_scope:
+                    # Stem-suffix fallback: handles renamed files where README scope lists
+                    # "PrefixX.sol" but the actual file is "X.sol" (e.g. SolidlyV3AMO.sol
+                    # listed in scope but V3AMO.sol is the real file). Accept when the scope
+                    # entry's stem ENDS WITH the actual file's stem and they share the same
+                    # directory, so we don't pull in unrelated files from other directories.
+                    file_stem_lower = file_path.stem.lower()
+                    file_dir_lower  = rel.parent.as_posix().lower()
+                    if file_stem_lower and any(
+                        Path(p).stem.lower().endswith(file_stem_lower)
+                        and Path(p).parent.as_posix().lower() == file_dir_lower
+                        for p in ins_paths if '/' in p
+                    ):
+                        in_scope = True
 
                 if not in_scope:
                     return True
@@ -3613,6 +3653,11 @@ PROTOCOL MODEL CONTEXT
             for_count = text.count('for (') + text.count('for(')
             if for_count > 0 and (text.count('safeTransfer') + text.count('transferFrom')) > 0:
                 s += 4
+
+            # Rust/Stylus callable ABI boundary: #[entrypoint] is the top-level dispatch target.
+            # Equivalent role to a delegatecall proxy in Solidity — needs cross-file ABI parity checks.
+            if '#[entrypoint]' in text:
+                s += 15
 
             return s
 
@@ -4042,10 +4087,9 @@ PROTOCOL MODEL CONTEXT
 
         try:
             content = read_file_text(source_dir / relative_path)
-            content_preview = content[:8000]
             messages = [
                 {"role": "system", "content": PROTOCOL_MODEL_PROMPT},
-                {"role": "user", "content": f"File: {relative_path}\n```\n{content_preview}\n```"},
+                {"role": "user", "content": f"File: {relative_path}\n```\n{content}\n```"},
             ]
             _proto_dl = getattr(self, '_proto_deadline', None)
             if _proto_dl is not None and time.time() >= _proto_dl:
@@ -4055,7 +4099,7 @@ PROTOCOL MODEL CONTEXT
             _proto_timeout = min(REQUEST_TIMEOUT, max(5, int(_proto_dl - time.time()))) if _proto_dl is not None else REQUEST_TIMEOUT
             resp = self.inference(
                 messages=messages, model=THINKING_MODEL, timeout=_proto_timeout,
-                call_type="protocol_model", file=relative_path, thinking_budget=1024,
+                call_type="protocol_model", file=relative_path, thinking_budget=2048,
             )
             content_str = (resp.get("content") or resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
             data = self.clean_json_response(content_str)
@@ -4070,7 +4114,7 @@ PROTOCOL MODEL CONTEXT
 
     def _select_prompts_for_file(self, relative_path: str, protocol_output: dict) -> list[tuple[str, str]]:
         """Return (prompt_name, prompt_text) pairs to run for this file in Phases 2 and 3.
-        Tier 2 prompts are handled separately (with thinking ON); this selects Tier 3 and Tier 4 only.
+        Tier 2 prompts are handled separately in Phase 1; this selects Tier 3 and Tier 4 only.
 
         Filtering layers (applied in order):
         1. protocol model skip_prompts  — explicit skips from THINKING_MODEL analysis
@@ -4155,7 +4199,7 @@ PROTOCOL MODEL CONTEXT
     def _run_verifier_soft_rank(self, vulns: list, source_dir: Path, deadline: float, file_rank_order: list[str] | None = None) -> list:
         """Adjust confidence scores using THINKING_MODEL as a soft verifier.
         Applies delta adjustments: +0.10 (strong evidence) | 0.0 (uncertain) | -0.20 (likely FP).
-        Removes a finding only if its adjusted confidence drops below 0.40.
+        Removes a finding only if its adjusted confidence drops below CONFIDENCE_THRESHOLD.
         Groups by file and runs in parallel; falls back to pass-through on failure."""
 
         if not vulns:
@@ -4190,14 +4234,9 @@ PROTOCOL MODEL CONTEXT
         else:
             candidate_files = [(fp, fv) for fp, fv in by_file.items() if fv]
 
-        _VERIFIER_CAP = 6
         adjusted_all: list = []
         removed_count = 0
 
-        for fp, fv in candidate_files[_VERIFIER_CAP:]:
-            adjusted_all.extend(fv)
-
-        files_to_verify = candidate_files[:_VERIFIER_CAP]
         verifier_ex = ThreadPoolExecutor(max_workers=5)
         v_futures: dict = {}
 
@@ -4208,7 +4247,7 @@ PROTOCOL MODEL CONTEXT
                 file_content = ""
 
                 try:
-                    file_content = read_file_text(source_dir / file_path)[:6000]
+                    file_content = read_file_text(source_dir / file_path)
                 except Exception:
                     pass
 
@@ -4245,7 +4284,7 @@ PROTOCOL MODEL CONTEXT
                     delta = adjustments.get(i, 0.0)
                     v.confidence = clamp(v.confidence + delta, 0.0, 1.0)
 
-                    if v.confidence >= 0.40:
+                    if v.confidence >= CONFIDENCE_THRESHOLD:
                         result.append(v)
                     else:
                         print(f"[verifier] removed '{v.title[:60]}' conf={v.confidence:.2f} delta={delta:+.2f}")
@@ -4258,7 +4297,7 @@ PROTOCOL MODEL CONTEXT
         processed_v_futures: set = set()
 
         try:
-            for file_path, file_vulns in files_to_verify:
+            for file_path, file_vulns in candidate_files:
                 if time.time() >= deadline:
                     adjusted_all.extend(file_vulns)
                     continue
@@ -4269,6 +4308,7 @@ PROTOCOL MODEL CONTEXT
 
             for fut in as_completed(v_futures, timeout=remaining):
                 processed_v_futures.add(fut)
+
                 try:
                     adjusted_all.extend(fut.result())
                 except Exception:
@@ -4277,7 +4317,9 @@ PROTOCOL MODEL CONTEXT
             for fut, fp in v_futures.items():
                 if fut in processed_v_futures:
                     continue
+
                 fut.cancel()
+
                 try:
                     adjusted_all.extend(fut.result() if fut.done() else by_file[fp])
                 except Exception:
@@ -4304,7 +4346,7 @@ PROTOCOL MODEL CONTEXT
                   requires ≥90 s remaining so the deep-dive is never starved by Phase 3
         Phase 3 : Two-pass at temperature=0.15 for recall diversity — runs only if
                   ≥120 s remain after Phase 4; lower priority than the deep-dive
-        Phase 5 : Verifier soft rank — THINKING_MODEL adjusts confidence, removes sub-0.40
+        Phase 5 : Verifier soft rank — THINKING_MODEL adjusts confidence, removes sub-0.75
         Phase 6 : Per-file cap → LLM merge → output cap at 100
         """
 
@@ -4323,7 +4365,6 @@ PROTOCOL MODEL CONTEXT
         self._collection_deadline = scan_deadline + 90  # deferred Phase 1/2 collection window
         self._total_deadline      = total_deadline
 
-        max_files_to_analyze = 30
         files = self.find_files_to_analyze(source_dir, file_patterns)
         files = self.rank_files_by_imports(files, source_dir)
         readme_path = source_dir / "README.md"
@@ -4336,8 +4377,8 @@ PROTOCOL MODEL CONTEXT
             except Exception:
                 pass
 
-        num_files = len(files[:max_files_to_analyze])
-        file_cap = min(18, num_files)
+        num_files = len(files[:MAX_FILES_TO_ANALYZE])
+        file_cap = min(MAX_FILE_CAP, num_files)
         files_skipped = num_files - file_cap
         use_two_pass = os.getenv('TWO_PASS', 'false').lower() != 'false'
         ranked_files = files[:file_cap]
@@ -4572,7 +4613,8 @@ PROTOCOL MODEL CONTEXT
                 return {}
 
             # ----------------------------------------------------------------
-            # Phase 1: Tier 2 breadth — A1-A4 + B, all files, thinking ON.
+            # Phase 1: Tier 2 breadth — A1-A4 + B, all files, thinking OFF (PRIMARY_MODEL, tb=0).
+            # SYSTEM_A1 on AMM-detected files gets tb=4096 (dynamic thinking enabled).
             # Starts immediately (parallel with Phase 0 background worker).
             # Submitted file-major (all prompts for file1, then file2, ...).
             #
@@ -4593,11 +4635,29 @@ PROTOCOL MODEL CONTEXT
                 rel = str(fp.relative_to(source_dir))
                 related = file_related[rel]
 
+                # AMM detection for SYSTEM_A1 thinking-budget upgrade.
+                # Phase 0 runs concurrently so proto_out is unavailable here;
+                # sniff file_texts instead. Markers chosen to be AMM-specific
+                # (rare in governance / utility files) to keep the upgrade narrow.
+                _fp_txt = file_texts.get(fp, "")
+                _is_amm_file = (
+                    ("amount_in" in _fp_txt and "amount_out" in _fp_txt) or
+                    "sqrt_price" in _fp_txt or
+                    "liquidity_delta" in _fp_txt or
+                    "tick_lower" in _fp_txt
+                )
+
                 for name, prompt in TOOL_LIST.items():
                     if name not in TIER2_PROMPT_NAMES:
                         continue
 
-                    f = _submit_analyze(rel, related, name, prompt)
+                    # Qwen3-80B-instruct supports dynamic thinking (tb > 0 enables it).
+                    # Give SYSTEM_A1 a thinking budget on AMM files so it can follow
+                    # multi-level accounting traces (e.g. a swap helper calling two
+                    # pool functions) without getting cut off at the first match.
+                    _p1_tb = 4096 if (name == "SYSTEM_A1" and _is_amm_file) else 0
+
+                    f = _submit_analyze(rel, related, name, prompt, tb=_p1_tb)
 
                     if f is None:
                         continue
@@ -4829,7 +4889,7 @@ PROTOCOL MODEL CONTEXT
 
         # ----------------------------------------------------------------
         # Phase 5: Verifier soft rank.
-        # Adjusts confidence; removes sub-0.40 findings before the expensive merge.
+        # Adjusts confidence; removes sub-0.75 findings before the expensive merge.
         # ----------------------------------------------------------------
 
         # Pre-cap per file before verifier so each per-file prompt stays within the
@@ -4837,7 +4897,9 @@ PROTOCOL MODEL CONTEXT
         # 80-100 raw findings, generating a ~10K-token prompt that can exceed the REQUEST_TIMEOUT cap.
         # Keep the top-60 by (confidence DESC, rule_score DESC) as a safety net for extreme
         # outlier files (150+ findings); 60 findings × ~130s inference < 500s budget.
-        _VERIFIER_PRE_CAP = 60
+        VERIFIER_BUDGET = 120
+        VERIFIER_PRE_CAP = 60
+        
         if all_vulnerabilities:
             _pre_cap_by_file: dict = defaultdict(list)
             for _v in all_vulnerabilities:
@@ -4845,11 +4907,11 @@ PROTOCOL MODEL CONTEXT
             all_vulnerabilities = []
             for _fvulns in _pre_cap_by_file.values():
                 _fvulns.sort(key=lambda v: (-v.confidence, -rule_score(v)))
-                all_vulnerabilities.extend(_fvulns[:_VERIFIER_PRE_CAP])
-            print(f"[pre_verifier] capped to {len(all_vulnerabilities)} findings (max {_VERIFIER_PRE_CAP}/file)", flush=True)
+                all_vulnerabilities.extend(_fvulns[:VERIFIER_PRE_CAP])
+            print(f"[pre_verifier] capped to {len(all_vulnerabilities)} findings (max {VERIFIER_PRE_CAP}/file)", flush=True)
 
         v_budget = verifier_deadline - time.time()
-        if v_budget > 60 and all_vulnerabilities:
+        if v_budget > VERIFIER_BUDGET and all_vulnerabilities:
             ranked_file_strs = [str(fp.relative_to(source_dir)) for fp in ranked_files]
             all_vulnerabilities = self._run_verifier_soft_rank(
                 all_vulnerabilities, source_dir, deadline=verifier_deadline,
@@ -4909,7 +4971,7 @@ PROTOCOL MODEL CONTEXT
         merge_elapsed = time.time() - merge_start
         print(f"[merge] raw={pre_merge_count} -> post-merge={post_merge_count} (elapsed {merge_elapsed:.1f}s)", flush=True)
 
-        vulns = roundrobin_select(vulns, max_output=100)
+        vulns = roundrobin_select(vulns, max_output=80)
         total_found = len(vulns)
         print(f"[final] post-merge={post_merge_count} -> after-cap={total_found}", flush=True)
 
@@ -4989,6 +5051,6 @@ if __name__ == '__main__':
     time.sleep(10)
     fetch_projects()
     inference_api = 'http://localhost:8087'
-    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/code4rena_superposition_2025_01'
+    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/sherlock_axion_2025_01'
 
     report = agent_main(project, inference_api=inference_api)
