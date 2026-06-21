@@ -21,7 +21,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 # so one slow call can never eat the run budget.
 REQUEST_TIMEOUT = 300
 
-CONFIDENCE_THRESHOLD = 0.75
+CONFIDENCE_THRESHOLD  = 0.55    # Pipeline minimum: scan-stage filter and post-verifier filter
+
+# Severity-calibration thresholds (enforced in _normalize_vuln_fields)
+CONF_CRITICAL_MIN     = 0.75    # critical requires conf >= this; else downgraded to high
+#                                 high/critical requires conf >= CONFIDENCE_THRESHOLD; else → medium
+
+# Scan-stage filter floor for medium-severity findings (higher bar than high/critical because
+# lower-severity findings carry a higher FP rate at the same confidence level)
+CONF_SCAN_MEDIUM      = 0.60
+
+# Priority-scoring thresholds (used in _score_finding)
+CONF_SCORE_BONUS      = 0.95    # confidence >= this earns  +0.3 priority score
+CONF_SCORE_PENALTY    = 0.60    # confidence <  this incurs -1.0 priority score
+
+# Fallback confidence when model output is malformed or omits the confidence field
+CONF_AGENTIC_FALLBACK = 0.70    # agentic deep-dive path
+CONF_SCAN_FALLBACK    = 0.50    # scan path
 
 MAX_FILES_TO_ANALYZE = 30
 MAX_FILE_CAP = 22
@@ -34,11 +50,6 @@ PRIMARY_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 
 # Non-reasoning model: used for all non-discovery steps (merge, cluster, JSON structuring, related-file lookup).
 JSON_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-
-# High-standard models apply strict internal criteria and self-report fewer findings at lower
-# confidence scores. Relax the post-processing confidence gate for their outputs so we don't
-# silently discard valid findings that a lower-standard model would have reported at CONFIDENCE_THRESHOLD.
-HIGH_STANDARD_MODELS = frozenset({"x-ai/grok-4.3"})
 
 # Thinking model: used for protocol-model stage and verifier soft-rank.
 # 235b-thinking has extended reasoning tokens for role classification and FP review.
@@ -94,7 +105,7 @@ _PROVIDER_ROUTING: dict[str, dict] = {
     },
 }
 
-AGENTIC_SYSTEM_PROMPT = dedent("""\
+AGENTIC_SYSTEM_PROMPT = dedent(f"""\
     You are a world-class smart contract security auditor with access to tools for project exploration.
     Your task: perform a deep-dive security audit on a single target file, following dependency chains as needed.
 
@@ -128,7 +139,7 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
       In both branches: after reading the counterpart file, enumerate ALL entry-point / public functions by name. For each function name that appears in both files, write down the FULL parameter list from position 0 for each side and compare them exactly — count parameters on each side before concluding. Do not stop after finding the first mismatch; complete the full enumeration so that mismatches in user-facing withdrawal or exit functions are not missed because an admin-function mismatch was found earlier.
     - After reading, call report_vulnerabilities with all findings.
     - Each description MUST be at most 800 characters. State root cause, exact function name, and impact.
-    - Report only exploit-ready findings with concrete proof. Confidence must be >= 0.75 for HIGH/CRITICAL.
+    - Report only exploit-ready findings with concrete proof. Confidence must be >= {CONFIDENCE_THRESHOLD} for HIGH/CRITICAL.
     - Do NOT report: admin-gated functions as "missing access control", gas optimizations, theoretical issues without exploit paths.
 
     SEVERITY DEFINITIONS (assign exactly one; be conservative):
@@ -136,7 +147,7 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
     - high: significant fund loss or irreversible protocol breakage, but requires a specific precondition: a particular role, a specific on-chain state, or a narrow timing window.
     - medium: limited or bounded impact, or requires multiple unlikely preconditions to chain together.
     - low: informational, best-practice violation, or no direct fund impact.
-    Most findings are high or medium. Reserve critical for the rarest, most direct, permissionless paths. A finding with confidence < 0.85 must not be critical.
+    Most findings are high or medium. Reserve critical for the rarest, most direct, permissionless paths. A finding with confidence < {CONF_CRITICAL_MIN} must not be critical.
 
     VULNERABILITY TYPE (use exactly one from this list; never use internal checklist labels):
     access_control | reentrancy | arithmetic | token_accounting | oracle_manipulation | signature_validation | front_running | gas_griefing | dos | logic_error | state_corruption | integration_mismatch | other
@@ -164,9 +175,9 @@ def _normalize_vuln_fields(vd: dict, fallback_conf: float = 0.5) -> dict:
     sev = str(vd.get("severity", "medium")).lower().strip()
     if sev not in ("critical", "high", "medium", "low"):
         sev = "medium"
-    if sev == "critical" and conf < 0.85:
+    if sev == "critical" and conf < CONF_CRITICAL_MIN:
         sev = "high"
-    if sev in ("critical", "high") and conf < 0.70:
+    if sev in ("critical", "high") and conf < CONFIDENCE_THRESHOLD:
         sev = "medium"
     vd["severity"] = sev
     return vd
@@ -561,7 +572,7 @@ If you cannot prove the path with specifics, DO NOT report.
 **High (0.85-0.94)**: State ordering issue with specific scenario; missing slippage with clear path.
 **Medium-High (0.75-0.84)**: Complex multi-step flow with conditional exploitation.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -714,7 +725,7 @@ If you cannot show the exploit path, DO NOT report.
 **High (0.85-0.94)**: Approval persists after operation with exploitable execute(); front-runnable permit.
 **Medium-High (0.75-0.84)**: Access control gap requiring specific timing or cooperation.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -830,7 +841,7 @@ If you cannot show the concrete mismatch with numbers, DO NOT report.
 **High (0.85-0.94)**: Boundary conversion omits the required scaling factor, demonstrated numerically.
 **Medium-High (0.75-0.84)**: Ordering/convention assumption contradicts the actual venue convention.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -951,7 +962,7 @@ execution for valid edge case.
 demonstrable overflow for realistic values.
 **Medium-High (0.75-0.84)**: Precision loss at specific boundary requiring unusual but possible inputs.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -1086,7 +1097,7 @@ variable lifecycle mismatch with arithmetic proof showing fund leak.
 violation with demonstrable inconsistent state.
 **Medium-High (0.75-0.84)**: Cross-language pattern requiring specific deployment configuration.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -1183,7 +1194,7 @@ Report at most 8 findings per analysis — only missing state updates.
 <confidence>
 **Very High (0.95-1.0)**: Variable clearly written in forward function, absent from reverse.
 **Below 0.75**: Do not report.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <output>
@@ -1284,7 +1295,7 @@ cross-contract reentry path or callee-observable intermediate state.
 **Medium-High (0.75-0.84)**: Ordering deviation requiring specific timing for
 exploitation with documented consequence.
 **Below 0.75**: Do not report as HIGH/CRITICAL.
-For HIGH/CRITICAL severity: confidence >= 0.75 required.
+For HIGH/CRITICAL severity: confidence >= 0.55 required.
 </confidence>
 
 <do_not_report>
@@ -1376,7 +1387,7 @@ When examining a router, proxy, or dispatcher contract: extend this check to ALL
 
 <output_requirements>
 Each finding: (1) function name, (2) the accounting or rate issue, (3) concrete impact.
-Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
+Report all concrete proven findings, confidence >= 0.55. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1423,7 +1434,7 @@ For functions that decide a vote, proposal, or quorum outcome, trace exactly whi
 
 <output_requirements>
 Each finding: (1) function name and role, (2) the authorization gap or value-extraction path, (3) concrete scenario, (4) economic impact.
-Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
+Report all concrete proven findings, confidence >= 0.55. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1474,7 +1485,7 @@ When a function in a shared or batched path reverts on a condition an ordinary p
 
 <output_requirements>
 Each finding: (1) function name, (2) the guard or ordering issue, (3) concrete exploit path, (4) whether a third party can PERMANENTLY block this operation for legitimate users (DoS).
-Report all concrete proven findings, confidence >= 0.75. Do not apply a count limit.
+Report all concrete proven findings, confidence >= 0.55. Do not apply a count limit.
 </output_requirements>
 
 <output>
@@ -1525,7 +1536,7 @@ For functions that transfer an accounting object (position, vesting record, stak
 Each finding must state: (1) the exact function name where the gap exists, (2) the specific storage field that is missing an update or not consumed, (3) why the field SHOULD be updated — what value it is expected to hold and how omitting the update causes incorrect behavior, (4) the concrete impact.
 For CHECK 2A: title format "Missing `<field>` in `<update_function>`".
 For CHECK 2B: title format "Missing decrement of `<field>` after `<function>`".
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -1601,7 +1612,7 @@ whose state the third party shifts
 - the concrete value siphoned, with a numeric example
 - the actual downstream effect using the consequence label above
 (over-minting / over-distribution / inflated redemption / bypass) Use a title that mentions the third-party / upstream-venue angle AND the consequence (for example "Third-party pool manipulation enables over-minting of protocol tokens" or "Third-party vault manipulation inflates privileged payout function").
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -1655,7 +1666,7 @@ the specific accumulator that drifts
 
 <output_requirements>
 Each finding must state: (1) the EXACT affected function name (including internal helpers), (2) the specific storage field or accumulator that is advanced / not decremented / read at the wrong moment, (3) the concrete attacker or user-action sequence that exploits the gap, (4) the victim and the magnitude of fees evaded, principal mis-credited, or value lost.
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -1711,7 +1722,7 @@ Verify that `DOMAIN_SEPARATOR` / `domainSeparator` is always computed from on-ch
 
 <output_requirements>
 Each finding: (1) function name, (2) the caller-controlled parameter, (3) the exact pre-condition the attacker exploits (existing allowance / default sentinel / open delegation), (4) the victim and the concrete loss.
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -1835,7 +1846,7 @@ For every reward-claim function: verify the amount transferred to the user and t
 
 <output_requirements>
 Each finding: (1) function name and accumulator/field involved, (2) concrete numerical example (e.g. totalSupply=1 wei, reward_rate=1e18/day → accumulator overflows in N days), (3) victim and magnitude of loss.
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -1874,7 +1885,7 @@ For contracts that use block.number as a proxy for elapsed time (e.g., reward-pe
 
 <output_requirements>
 Each finding: (1) function name, (2) the specific on-chain value used as entropy or timing source, (3) who can manipulate it and how, (4) concrete economic impact.
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -2105,7 +2116,7 @@ For any operation that converts between a packed/encoded type and a plain intege
 
 <output_requirements>
 Each finding: (1) function name, (2) the specific input or boundary that triggers the issue, (3) the wrong output or revert behavior produced, (4) the correct expected behavior, (5) concrete numerical example.
-Report at most 5 findings, confidence >= 0.75.
+Report at most 5 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -2151,7 +2162,7 @@ In functions routing through multiple pools sequentially, when a step fills less
 
 <output_requirements>
 Each finding: (1) function name, (2) which invariant or formula is violated, (3) concrete exploit scenario with numbers, (4) economic impact.
-Report at most 4 findings, confidence >= 0.75.
+Report at most 4 findings, confidence >= 0.55.
 </output_requirements>
 
 <output>
@@ -2605,9 +2616,9 @@ def rule_score(vuln) -> float:
         score -= 2.0
     elif severity == "low":
         score -= 4.0
-    if confidence >= 0.95:
+    if confidence >= CONF_SCORE_BONUS:
         score += 0.3
-    elif confidence < 0.80:
+    elif confidence < CONF_SCORE_PENALTY:
         score -= 1.0
 
     fp_keyword_total = 0.0
@@ -3128,9 +3139,9 @@ class BaselineRunner:
                             vd["reported_by_model"] = f"{_ag_model}_agentic"
                             vd.setdefault("title", "Untitled"); vd.setdefault("description", vd["title"])
                             vd.setdefault("vulnerability_type", "other"); vd.setdefault("severity", "medium")
-                            vd.setdefault("confidence", 0.7); vd.setdefault("location", "Unknown")
+                            vd.setdefault("confidence", CONF_AGENTIC_FALLBACK); vd.setdefault("location", "Unknown")
                             vd.setdefault("file", relative_path)
-                            _normalize_vuln_fields(vd, fallback_conf=0.7)
+                            _normalize_vuln_fields(vd, fallback_conf=CONF_AGENTIC_FALLBACK)
                             all_vulns.append(Vulnerability(**vd))
                         except Exception:
                             pass
@@ -3169,7 +3180,7 @@ class BaselineRunner:
             "{format_instructions}",
             '[{"title": "...", "description": "...", '
             '"vulnerability_type": "access_control|reentrancy|arithmetic|token_accounting|oracle_manipulation|signature_validation|front_running|gas_griefing|dos|logic_error|state_corruption|integration_mismatch|other", '
-            '"severity": "critical(permissionless total loss, conf>=0.85 only)|high(significant but conditional)|medium(limited/theoretical)|low(informational)", '
+            f'"severity": "critical(permissionless total loss, conf>={CONF_CRITICAL_MIN} only)|high(significant but conditional)|medium(limited/theoretical)|low(informational)", '
             '"confidence": 0.0-1.0, "location": "FunctionName", "file": "path/to/file.sol"}]}',
         )
 
@@ -3314,10 +3325,10 @@ PROTOCOL MODEL CONTEXT
                         v.setdefault("description", v.get("title", "No description"))
                         v.setdefault("vulnerability_type", "Unknown")
                         v.setdefault("severity", "medium")
-                        v.setdefault("confidence", 0.5)
+                        v.setdefault("confidence", CONF_SCAN_FALLBACK)
                         v.setdefault("location", "Unknown")
                         v.setdefault("file", str(file_path))
-                        _normalize_vuln_fields(v, fallback_conf=0.5)
+                        _normalize_vuln_fields(v, fallback_conf=CONF_SCAN_FALLBACK)
                         sanitized.append(v)
 
                     msg_json["vulnerabilities"] = sanitized
@@ -3327,22 +3338,14 @@ PROTOCOL MODEL CONTEXT
                 msg_json.setdefault("vulnerabilities", [])
                 vulnerabilities = Vulnerabilities(**msg_json)
 
-                # High-standard models (e.g. grok-4.3) self-apply strict internal criteria
-                # and only surface findings they are already very confident about, so their
-                # reported confidence scores are systematically lower than what an equivalent
-                # finding from a less-strict model would show.  Relax the gate for them so
-                # we don't silently discard valid high-confidence findings.
-                _is_high_std = (model or PRIMARY_MODEL) in HIGH_STANDARD_MODELS
-                _hc_min  = 0.55 if _is_high_std else CONFIDENCE_THRESHOLD
-                _med_min = 0.45 if _is_high_std else 0.60
                 filtered_vulns = []
 
                 for v in vulnerabilities.vulnerabilities:
                     if v.severity in [Severity.HIGH, Severity.CRITICAL]:
-                        if v.confidence >= _hc_min:
+                        if v.confidence >= CONFIDENCE_THRESHOLD:
                             filtered_vulns.append(v)
                     else:
-                        if v.confidence >= _med_min:
+                        if v.confidence >= CONF_SCAN_MEDIUM:
                             filtered_vulns.append(v)
 
                 vulnerabilities.vulnerabilities = filtered_vulns
