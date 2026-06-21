@@ -130,7 +130,46 @@ AGENTIC_SYSTEM_PROMPT = dedent("""\
     - Each description MUST be at most 800 characters. State root cause, exact function name, and impact.
     - Report only exploit-ready findings with concrete proof. Confidence must be >= 0.75 for HIGH/CRITICAL.
     - Do NOT report: admin-gated functions as "missing access control", gas optimizations, theoretical issues without exploit paths.
+
+    SEVERITY DEFINITIONS (assign exactly one; be conservative):
+    - critical: permissionless external trigger causes loss of ALL or MOST protocol/user funds. No role gate, no prerequisite state — any address can execute the exploit from a clean state.
+    - high: significant fund loss or irreversible protocol breakage, but requires a specific precondition: a particular role, a specific on-chain state, or a narrow timing window.
+    - medium: limited or bounded impact, or requires multiple unlikely preconditions to chain together.
+    - low: informational, best-practice violation, or no direct fund impact.
+    Most findings are high or medium. Reserve critical for the rarest, most direct, permissionless paths. A finding with confidence < 0.85 must not be critical.
+
+    VULNERABILITY TYPE (use exactly one from this list; never use internal checklist labels):
+    access_control | reentrancy | arithmetic | token_accounting | oracle_manipulation | signature_validation | front_running | gas_griefing | dos | logic_error | state_corruption | integration_mismatch | other
 """)
+
+# Closed set of allowed vulnerability_type values — enforced in post-processing for both scan and agentic paths.
+_VT_ALLOWED = frozenset({
+    "access_control", "reentrancy", "arithmetic", "token_accounting",
+    "oracle_manipulation", "signature_validation", "front_running", "gas_griefing",
+    "dos", "logic_error", "state_corruption", "integration_mismatch", "other",
+})
+
+def _normalize_vuln_fields(vd: dict, fallback_conf: float = 0.5) -> dict:
+    """Normalize vulnerability_type, confidence, and severity in-place. Returns vd.
+    Called after scan parsing, after agentic parsing, and after LLM merge so no
+    path can bypass the closed-set taxonomy or confidence-based severity cap."""
+    vt = str(vd.get("vulnerability_type", "other")).lower().strip()
+    vd["vulnerability_type"] = vt if vt in _VT_ALLOWED else "other"
+    try:
+        conf = float(vd.get("confidence", fallback_conf))
+    except (TypeError, ValueError):
+        conf = fallback_conf
+    vd["confidence"] = max(0.0, min(1.0, conf))
+    conf = vd["confidence"]
+    sev = str(vd.get("severity", "medium")).lower().strip()
+    if sev not in ("critical", "high", "medium", "low"):
+        sev = "medium"
+    if sev == "critical" and conf < 0.85:
+        sev = "high"
+    if sev in ("critical", "high") and conf < 0.70:
+        sev = "medium"
+    vd["severity"] = sev
+    return vd
 
 # A trailing test-MODULE marker, anchored to the start of a line (optionally indented):
 #   - `#[cfg(test)]` (or `#[cfg(all(test,...))]`) immediately followed by a `mod <name>`
@@ -246,7 +285,7 @@ TOOL_DEFINITIONS = [
                             "properties": {
                                 "title": {"type": "string"},
                                 "description": {"type": "string"},
-                                "vulnerability_type": {"type": "string"},
+                                "vulnerability_type": {"type": "string", "enum": ["access_control", "reentrancy", "arithmetic", "token_accounting", "oracle_manipulation", "signature_validation", "front_running", "gas_griefing", "dos", "logic_error", "state_corruption", "integration_mismatch", "other"], "description": "Vulnerability category from the closed set. Never use internal checklist labels such as CHECK 1, CHECK 2B, MINIMUM_OUTPUT_PROTECTION, or PRIVILEGED_FUNCTION_DEPENDS_ON_MANIPULABLE_EXTERNAL_VALUE."},
                                 "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
                                 "confidence": {"type": "number"},
                                 "location": {"type": "string"},
@@ -2095,10 +2134,10 @@ CHECK 3 — POOL INITIALIZATION AND EDGE CASES:
 For pool creation and initial liquidity addition, verify the protocol handles the zero-liquidity case (which otherwise causes division-by-zero on the first operation) and rejects or correctly handles tokens with non-standard decimals at initialization time.
 
 CHECK 4 — EXTERNAL DEX PROTOCOL COMPATIBILITY:
-When the contract calls into an external DEX, verify: (a) the call interface matches the actual deployed protocol version — a fork may add/remove parameters or change the fee structure under the same function name, so calling against the wrong signature aborts at runtime; (b) multi-step pool interactions actually retrieve the tokens they are owed — some pool operations only CREDIT tokens to a position internally and require a separate explicit collect/withdraw call to transfer them out; an integration that performs the first step but omits the second leaves funds stranded in the pool; (c) any decision about swap direction or which side is input/output is resolved by QUERYING the pool's token ordering at runtime, never hardcoded — pools sort their two tokens by address, so a hardcoded assumption that a specific named token always occupies a given slot produces a reversed direction (or a wrong fee tier) whenever the addresses sort the opposite way, sending the swap the wrong way. (d) For factory calls that create a pool/pair, verify the already-exists case is handled, since a revert-on-exists factory can be blocked by pre-creation. (e) For contracts that call a combined liquidity-removal-and-fee-collection function on a concentrated-liquidity pool in a single external call, verify that ALL returned token amounts are fully used. Such functions typically return two sets of amounts: tokens removed from the position (principal) and separately accrued fee tokens. If downstream logic uses only the principal amounts for a subsequent swap or transfer while fee amounts are merely recorded in an event and never transferred, swapped, or re-invested, the fee tokens accumulate in the calling contract with no extraction path. Assign confidence = 0.9 when confirmed. (f) When a contract integrates with external staking or gauge contracts across multiple DEX ecosystems, verify that function parameter semantics match the gauge implementation deployed for that specific DEX. Different DEX ecosystems often expose identically-named gauge functions but with incompatible parameter types — one ecosystem may identify a staked position by the LP token amount, while another identifies positions by a numeric token or NFT identifier. Calling a gauge function with the wrong parameter type (e.g., passing a token amount where an identifier is expected) either reverts or affects an unintended position, potentially locking staked LP tokens permanently. Assign confidence = 0.9 when confirmed.
+When the contract calls into an external DEX, verify: (a) the call interface matches the actual deployed protocol version — a fork may add/remove parameters or change the fee structure under the same function name, so calling against the wrong signature aborts at runtime; (b) multi-step pool interactions actually retrieve the tokens they are owed — some pool operations only CREDIT tokens to a position internally and require a separate explicit collect/withdraw call to transfer them out; an integration that performs the first step but omits the second leaves funds stranded in the pool; (c) any decision about swap direction or which side is input/output is resolved by QUERYING the pool's token ordering at runtime, never hardcoded — pools sort their two tokens by address, so a hardcoded assumption that a specific named token always occupies a given slot produces a reversed direction (or a wrong fee tier) whenever the addresses sort the opposite way, sending the swap the wrong way. (d) For factory calls that create a pool/pair, verify the already-exists case is handled, since a revert-on-exists factory can be blocked by pre-creation. (e) For contracts that call a combined liquidity-removal-and-fee-collection function on a concentrated-liquidity pool in a single external call, verify that ALL returned token amounts are fully used. Such functions typically return two sets of amounts: tokens removed from the position (principal) and separately accrued fee tokens. If downstream logic uses only the principal amounts for a subsequent swap or transfer while fee amounts are merely recorded in an event and never transferred, swapped, or re-invested, the fee tokens accumulate in the calling contract with no extraction path. Assign confidence = 0.95 when confirmed. (f) When a contract integrates with external staking or gauge contracts across multiple DEX ecosystems, verify that function parameter semantics match the gauge implementation deployed for that specific DEX. Different DEX ecosystems often expose identically-named gauge functions but with incompatible parameter types — one ecosystem may identify a staked position by the LP token amount, while another identifies positions by a numeric token or NFT identifier. Calling a gauge function with the wrong parameter type (e.g., passing a token amount where an identifier is expected) either reverts or affects an unintended position, potentially locking staked LP tokens permanently. Assign confidence = 0.95 when confirmed.
 
 CHECK 5 — LIQUIDITY CALCULATION FORMULA:
-For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range.
+For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range. Additionally, for AMO or rebalancing contracts that contain a no-argument internal or public function that estimates how much liquidity to add or remove using live pool token balances (e.g., reading IERC20.balanceOf(pool) to derive the imbalance and then computing a liquidity delta from that imbalance): verify those balance inputs are not externally manipulable. Live pool token balances can be altered by anyone donating tokens directly to the pool address or executing flash transactions that temporarily shift the pool state — if the estimation formula feeds directly from these balances, an adversary can front-run the AMO's rebalancing call to skew the estimated liquidity amount, causing the protocol to over-burn or under-burn position liquidity. Assign confidence = 0.95 when the estimation reads IERC20.balanceOf(pool) or an equivalent pool-balance query as a direct formula input without a manipulation-resistance mechanism (e.g., time-weighted average, minimum/maximum clamp, or oracle cross-check).
 
 CHECK 6 — MULTI-STEP FILL AND REFUND ACCOUNTING:
 In functions routing through multiple pools sequentially, when a step fills less than requested, verify what is debited from the caller and what is refunded reconcile against what was actually consumed. Refunding a difference that was never debited lets the caller pay nothing or receive free tokens. Enumerate every path where partial fills are possible and confirm debit and refund are mutually consistent.
@@ -3081,20 +3120,20 @@ class BaselineRunner:
 
                     try:
                         args = json.loads(tc["function"]["arguments"])
+                    except Exception:
+                        args = {}
 
-                        for vd in args.get("vulnerabilities", []):
+                    for vd in args.get("vulnerabilities", []):
+                        try:
                             vd["reported_by_model"] = f"{_ag_model}_agentic"
                             vd.setdefault("title", "Untitled"); vd.setdefault("description", vd["title"])
-                            vd.setdefault("vulnerability_type", "Unknown"); vd.setdefault("severity", "medium")
+                            vd.setdefault("vulnerability_type", "other"); vd.setdefault("severity", "medium")
                             vd.setdefault("confidence", 0.7); vd.setdefault("location", "Unknown")
                             vd.setdefault("file", relative_path)
-
-                            try:
-                                all_vulns.append(Vulnerability(**vd))
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                            _normalize_vuln_fields(vd, fallback_conf=0.7)
+                            all_vulns.append(Vulnerability(**vd))
+                        except Exception:
+                            pass
 
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result_str})
 
@@ -3128,9 +3167,10 @@ class BaselineRunner:
 
         system_prompt = system_prompt.replace(
             "{format_instructions}",
-            '[{"title": "...", "description": "...", "vulnerability_type": "...", '
-            '"severity": "critical|high|medium|low", "confidence": 0.0-1.0, '
-            '"location": "FunctionName", "file": "path/to/file.sol"}]}',
+            '[{"title": "...", "description": "...", '
+            '"vulnerability_type": "access_control|reentrancy|arithmetic|token_accounting|oracle_manipulation|signature_validation|front_running|gas_griefing|dos|logic_error|state_corruption|integration_mismatch|other", '
+            '"severity": "critical(permissionless total loss, conf>=0.85 only)|high(significant but conditional)|medium(limited/theoretical)|low(informational)", '
+            '"confidence": 0.0-1.0, "location": "FunctionName", "file": "path/to/file.sol"}]}',
         )
 
         file_content_for_user_prompt = f"""
@@ -3277,18 +3317,7 @@ PROTOCOL MODEL CONTEXT
                         v.setdefault("confidence", 0.5)
                         v.setdefault("location", "Unknown")
                         v.setdefault("file", str(file_path))
-                        sev = str(v["severity"]).lower().strip()
-
-                        if sev not in ("critical", "high", "medium", "low"):
-                            v["severity"] = "medium"
-                        else:
-                            v["severity"] = sev
-
-                        try:
-                            v["confidence"] = float(v["confidence"])
-                        except (ValueError, TypeError):
-                            v["confidence"] = 0.5
-
+                        _normalize_vuln_fields(v, fallback_conf=0.5)
                         sanitized.append(v)
 
                     msg_json["vulnerabilities"] = sanitized
@@ -3979,19 +4008,15 @@ PROTOCOL MODEL CONTEXT
 
                 title = (entry.get('title') or best_member.title).strip()
                 description = (entry.get('description') or best_member.description).strip()
-                vtype = (entry.get('vulnerability_type') or best_member.vulnerability_type).strip()
-                sev_str = (entry.get('severity') or "high").lower().strip()
-                severity = sev_map.get(sev_str, best_member.severity)
-
-                try:
-                    confidence = float(entry.get('confidence', best_member.confidence))
-                except (TypeError, ValueError):
-                    confidence = best_member.confidence
-
-                # Clamp only — no cluster-size boost.  Inflating by consensus count
-                # distorts ranking and over-promotes noisy duplicates over high-evidence
-                # singletons that simply didn't recur across prompts.
-                confidence = max(0.0, min(1.0, confidence))
+                entry.setdefault("vulnerability_type", best_member.vulnerability_type)
+                entry.setdefault("severity", best_member.severity.value if best_member.severity else "high")
+                entry.setdefault("confidence", best_member.confidence)
+                # Apply the same closed-set taxonomy and confidence-based severity cap
+                # as the scan and agentic paths so the merge stage cannot undo them.
+                _normalize_vuln_fields(entry, fallback_conf=best_member.confidence)
+                vtype = entry["vulnerability_type"]
+                severity = sev_map.get(entry["severity"], best_member.severity)
+                confidence = entry["confidence"]
                 location = (entry.get('location') or best_member.location).strip()
                 file_field = (entry.get('file') or best_member.file).strip()
                 source_models = sorted(set(v.reported_by_model for v in cluster if v.reported_by_model))

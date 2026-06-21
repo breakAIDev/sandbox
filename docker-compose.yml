@@ -1,7 +1,7 @@
 services:
   validator:
     build: .
-    restart: unless-stopped
+    restart: "no"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./jobs:/app/jobs
@@ -14,3 +14,5 @@ services:
       - LOCAL
       # - SKIP_EXECUTION
       # - SKIP_EVALUATION
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
