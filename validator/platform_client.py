@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import secrets
 import time
 from typing import Any, Literal
@@ -228,23 +229,31 @@ class MockPlatformClient:
 
     def get_job_run_agent(self, job_run_id: int):
         execution_api_key = settings.inference_api_key
+        default_project_keys = [
+            # "code4rena_secondswap_2025_02",
+            "code4rena_superposition_2025_01",
+            # "code4rena_loopfi_2025_02",
+            "code4rena_lambowin_2025_02",
+            # "code4rena_bakerfi-invitational_2025_02",
+            "cantina_minimal-delegation_2025_04",
+            # "code4rena_kinetiq_2025_07",
+            # "cantina_smart-contract-audit-of-tn-contracts_2025_08",
+            "code4rena_forte-float128-solidity-library_2025_04",
+            # "sherlock_perennial_v2_update_3_2024_08",
+            "sherlock_axion_2025_01",
+            # "sherlock_oku_2024_12",
+            "code4rena_pump-science_2025_02",
+            "code4rena_virtuals-protocol_2025_08",
+        ]
+        project_keys_env = os.getenv("LOCAL_PROJECT_KEYS", "").strip()
+        project_keys = (
+            [p.strip() for p in project_keys_env.split(",") if p.strip()]
+            if project_keys_env
+            else default_project_keys
+        )
+
         agent = {
-            "project_keys": [
-                # "code4rena_secondswap_2025_02",
-                "code4rena_superposition_2025_01",
-                # "code4rena_loopfi_2025_02",
-                "code4rena_lambowin_2025_02",
-                # "code4rena_bakerfi-invitational_2025_02",
-                "cantina_minimal-delegation_2025_04",
-                # "code4rena_kinetiq_2025_07",
-                # "cantina_smart-contract-audit-of-tn-contracts_2025_08",
-                "code4rena_forte-float128-solidity-library_2025_04",
-                # "sherlock_perennial_v2_update_3_2024_08",
-                "sherlock_axion_2025_01",
-                # "sherlock_oku_2024_12",
-                "code4rena_pump-science_2025_02",
-                "code4rena_virtuals-protocol_2025_08",
-            ],
+            "project_keys": project_keys,
             "execution_api_key": execution_api_key,
         }
         return agent
