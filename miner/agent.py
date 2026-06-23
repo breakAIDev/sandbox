@@ -40,7 +40,7 @@ CONF_AGENTIC_FALLBACK = 0.70    # agentic deep-dive path
 CONF_SCAN_FALLBACK    = 0.50    # scan path
 
 MAX_FILES_TO_ANALYZE = 30
-MAX_FILE_CAP = 22
+MAX_FILE_CAP = 18
 
 # PRIMARY_MODEL is the high-volume scan model. It runs analyze_file() with all specialized
 # prompts intact. A fast non-reasoning instruct model is used here for scan throughput;
@@ -726,6 +726,11 @@ SYSTEM_E = """
             (2) is a nonce or signature consumed before the dispatch loop? IMPORTANT: the nonce consumption may be inside a helper function called before the dispatch loop (e.g., _handleVerifySignature, _useNonce, _validateSignature, or any function that invokes a nonce manager) — trace the full call chain, not just the direct body of the entry point.
             (3) does the dispatch loop forward gas via a low-level call where the callee receives less gas than the caller had?
         If all three conditions are present, this is an exploitable gas-grief/credential-burn pattern. When all three are confirmed: assign confidence = 0.90.
+        CRITICAL DISTINCTION:
+            This gas-grief attack is entirely separate from the "nonce consumed before signature validation" ordering bug.
+            In this attack, the signature IS valid and validates correctly — the nonce consumption is legitimate and intended.
+            The exploit does not rely on signature failure; it relies on the fact that after a SUCCESSFUL signature check and nonce consumption, the attacker supplies a calibrated gas limit that leaves too little gas for the dispatch loop's subcalls.
+            Do NOT conflate these two bugs: if you find that "nonce is consumed before signature validation" (where the nonce burns on signature failure), that is a different vulnerability from the gas-grief attack (where the nonce burns after successful validation but subcalls are gas-starved).
         Frame the finding as a gas-griefing/credential-burn exploit, not a state-propagation or missing-field bug — the attacker calibrates the outer call's gas limit so the inner subcall is starved while the credential has already been consumed and the outer call returned success.
         MANDATORY TITLE FORMAT: use "Gas-Grief/Nonce-Burn via Calibrated Outer Gas Limit in [function_name]" where [function_name] is the batch/execute entry point.
         MANDATORY vulnerability_type: "gas_griefing_nonce_burn". The description MUST explicitly state that the nonce or credential is consumed before the failing subcall and that the caller controls the outer gas limit to starve inner subcalls.
@@ -1650,6 +1655,10 @@ PROMPT_ARITHMETIC = """
                     If the condition reads a correlated but structurally distinct field — for example, reading a scale or exponent to decide how many significant digits the significant field carries, rather than measuring the actual digit count of that field — then inputs where the proxy disagrees with the true selector will be encoded in the wrong format, causing precision loss or structural corruption for that input subset.
                     The fix is always to derive the format selector directly from the property it logically governs (digit count → read digit count; value range → read the value; bit width → measure the bits).
                     Concrete shape to look for: a packing or encoding function that selects between a smaller format (M-size, compact, short) and a larger format (L-size, extended, long) by testing only whether the EXPONENT falls within a threshold, while the DIGIT COUNT of the mantissa field is available but not checked — this function will incorrectly downcast a mantissa whose digit count exceeds the smaller format's capacity whenever the exponent condition is satisfied, silently dividing off significant digits in the process.
+                    Assign confidence = 0.85 when:
+                        (1) a packing/encoding function branches between two output formats based on the exponent alone,
+                        (2) a variable representing digit count or mantissa size is computed and available but NOT included in the branching condition, and
+                        (3) the smaller-format branch divides the mantissa by a power of the base to truncate it — the truncated digits are permanently lost.
     </method>
 
     <do_not_report>
@@ -1727,9 +1736,11 @@ PROMPT_DEX_INTEGRATION = """
                     Assign confidence = 0.95 when confirmed.
         CHECK 5 — LIQUIDITY CALCULATION FORMULA:
             For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range.
-            Additionally, for AMO or rebalancing contracts that contain a no-argument internal or public function that estimates how much liquidity to add or remove using live pool token balances (e.g., reading IERC20.balanceOf(pool) to derive the imbalance and then computing a liquidity delta from that imbalance): verify those balance inputs are not externally manipulable.
+            Additionally, for AMO or rebalancing contracts that contain a function (with or without arguments) that estimates how much liquidity to add or remove using live pool token balances (e.g., reading IERC20.balanceOf(pool) to derive the imbalance and then computing a liquidity delta from that imbalance): verify those balance inputs are not externally manipulable.
             Live pool token balances can be altered by anyone donating tokens directly to the pool address or executing flash transactions that temporarily shift the pool state — if the estimation formula feeds directly from these balances, an adversary can front-run the AMO's rebalancing call to skew the estimated liquidity amount, causing the protocol to over-burn or under-burn position liquidity.
-            Assign confidence = 0.95 when the estimation reads IERC20.balanceOf(pool) or an equivalent pool-balance query as a direct formula input without a manipulation-resistance mechanism (e.g., time-weighted average, minimum/maximum clamp, or oracle cross-check).
+            In Uniswap V3-style concentrated liquidity pools, using IERC20.balanceOf(pool) as the denominator in a liquidity computation is structurally incorrect even apart from manipulation: the pool holds tokens from ALL active tick-range positions, not only the AMO's current tick range. A formula of `liquidity = inputAmount * currentLiquidity / balanceOf(pool)` systematically underestimates the correct liquidity because currentLiquidity covers only the active range while balanceOf(pool) is inflated by every other position.
+            This structural error is present regardless of whether the balance is manipulated, and compounds with manipulation to produce large deviations.
+            Assign confidence = 0.90 when the liquidity estimation reads IERC20.balanceOf(pool) or pool.token0Balance() / pool.token1Balance() as the denominator while dividing by pool.liquidity() or slot0.sqrtPriceX96 (the active-range liquidity), since balanceOf covers all positions across all tick ranges while liquidity covers only the active range — these two quantities are not proportional and cannot be used together to derive a correct liquidity delta.
         CHECK 6 — MULTI-STEP FILL AND REFUND ACCOUNTING:
             In functions routing through multiple pools sequentially, when a step fills less than requested, verify what is debited from the caller and what is refunded reconcile against what was actually consumed.
             Refunding a difference that was never debited lets the caller pay nothing or receive free tokens.
@@ -1857,6 +1868,8 @@ ANCHOR_LANG_HINT = """
             The target account's seeds do NOT need to be visible in the current file: if the account is `UncheckedAccount<'info>` and is passed as writable to an external `create_*` instruction, and the seed inputs to that create call are derived from publicly-visible accounts already present in the instruction's account context (pool.key(), fee_receiver.key(), lp_mint.key(), or equivalent), an attacker can derive the PDA address externally and pre-create it.
             Assign confidence = 0.90 when all three conditions hold: the target account is declared with no seeds, owner, or program constraint (UncheckedAccount or equivalent), it is passed writable to an external create_* or init_* CPI (including raw invoke_signed with a create-named discriminator), and its address is derivable from publicly-known on-chain parameters visible in the accounts passed to this instruction.
             This is a CRITICAL severity finding — once the account is pre-created, every future invocation of the parent instruction fails permanently with no recovery path.
+            Title this finding "[instruction_name] is Permanently DoS-able via Pre-Creation of [account_name]" or "CPI DoS: Pre-Created [account_name] Blocks [instruction_name]" — the title must name both the blocked instruction and the specific account that can be pre-created.
+            Report EACH (UncheckedAccount, create_* CPI) pair as a SEPARATE finding: if one instruction contains two separate create_* CPIs (e.g., one for create_pool and another for create_lock_escrow), emit two findings — one per account — even if they share the same instruction context.
         - `has_one` and `constraint` annotations validate account relationships.
             Missing ones allow forged accounts to satisfy account-context typing while carrying attacker-controlled data.
         - Protocol-wide config / state accounts aggregate totals.
