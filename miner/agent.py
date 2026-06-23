@@ -732,8 +732,14 @@ SYSTEM_E = """
             The exploit does not rely on signature failure; it relies on the fact that after a SUCCESSFUL signature check and nonce consumption, the attacker supplies a calibrated gas limit that leaves too little gas for the dispatch loop's subcalls.
             Do NOT conflate these two bugs: if you find that "nonce is consumed before signature validation" (where the nonce burns on signature failure), that is a different vulnerability from the gas-grief attack (where the nonce burns after successful validation but subcalls are gas-starved).
         Frame the finding as a gas-griefing/credential-burn exploit, not a state-propagation or missing-field bug — the attacker calibrates the outer call's gas limit so the inner subcall is starved while the credential has already been consumed and the outer call returned success.
-        MANDATORY TITLE FORMAT: use "Gas-Grief/Nonce-Burn via Calibrated Outer Gas Limit in [function_name]" where [function_name] is the batch/execute entry point.
-        MANDATORY vulnerability_type: "gas_griefing_nonce_burn". The description MUST explicitly state that the nonce or credential is consumed before the failing subcall and that the caller controls the outer gas limit to starve inner subcalls.
+        MANDATORY TITLE FORMAT: use "[entry_function] Calls Can Be Forced to Fail via Calibrated Gas Limit" where [entry_function] is the PUBLIC/EXTERNAL function the attacker calls directly — the function whose name appears in the ABI and that an external caller can invoke by name (e.g., execute, executeWithSig, executeBatch, executeCall).
+        The [entry_function] MUST NOT be an internal helper such as _useNonce, _handleVerifySignature, _validateSignature, or _dispatch — those are called by the entry function but are never themselves the attack vector. If _useNonce or _handleVerifySignature is called from execute(SignedBatchedCall, wrappedSignature), then [entry_function] = "execute".
+        MANDATORY vulnerability_type: "gas_griefing_nonce_burn".
+        The description MUST explicitly state that:
+            (a) the attacker calls [entry_function] directly with a calibrated outer gas limit,
+            (b) signature validation and nonce/credential consumption succeed inside the entry function, and
+            (c) the dispatch loop's subcalls fail silently out-of-gas because the outer gas limit was set too low.
+        The location field must name the public entry function, not the internal helper.
         Do NOT title this finding "unchecked call return", "silent failure", or "missing revert check" — those titles describe a return-value check pattern, not the external gas-calibration attack being reported here.
         After any external call that consumes a granted resource, walk through every return path (success, partial-consume, revert-but-handled, early-return on insufficient balance) and verify the cleanup statement is actually reached on each.
         Function parameters that designate ownership of funds being moved should not be freely caller-controlled — when the caller can name any account whose funds the function operates on, the function may operate on accounts the caller has no relationship to.
@@ -1870,6 +1876,11 @@ ANCHOR_LANG_HINT = """
             This is a CRITICAL severity finding — once the account is pre-created, every future invocation of the parent instruction fails permanently with no recovery path.
             Title this finding "[instruction_name] is Permanently DoS-able via Pre-Creation of [account_name]" or "CPI DoS: Pre-Created [account_name] Blocks [instruction_name]" — the title must name both the blocked instruction and the specific account that can be pre-created.
             Report EACH (UncheckedAccount, create_* CPI) pair as a SEPARATE finding: if one instruction contains two separate create_* CPIs (e.g., one for create_pool and another for create_lock_escrow), emit two findings — one per account — even if they share the same instruction context.
+            CRITICAL DISTINCTION — do not let a different UncheckedAccount vulnerability suppress this finding: in a raw invoke_signed call, the PROGRAM ACCOUNT being UncheckedAccount is a DIFFERENT vulnerability (arbitrary CPI / code injection).
+            The TARGET ACCOUNT being UncheckedAccount (the account that the external program will initialize as a new PDA) is the PDA pre-creation DoS vulnerability described here.
+            Both findings are valid and must be reported INDEPENDENTLY.
+            If lock_pool.rs passes `meteora_program` as an UncheckedAccount program (arbitrary program injection) AND passes `lock_escrow` as an UncheckedAccount target to a create_lock_escrow CPI, you must report TWO findings: one for the arbitrary-program vulnerability and a SEPARATE one titled "lock_pool is Permanently DoS-able via Pre-Creation of lock_escrow".
+            Do NOT suppress the lock_escrow finding just because you already reported the meteora_program finding.
         - `has_one` and `constraint` annotations validate account relationships.
             Missing ones allow forged accounts to satisfy account-context typing while carrying attacker-controlled data.
         - Protocol-wide config / state accounts aggregate totals.
