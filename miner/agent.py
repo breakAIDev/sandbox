@@ -250,9 +250,23 @@ SYSTEM_A4 = _SYSTEM_A_COMMON_HEADER + """
         Second, the tracking key the skip condition compares against is reassigned at the end of every iteration;
         a tracker that is never updated stays at its initialization value (commonly 0 / the zero address), so the skip either never fires, or fires on the very first item when the input matches that sentinel — dispatching funds or state through the still-uninitialized variable to the zero address.
         Walk every storage write in the loop body and confirm the tracker is among them.
+        Report the loop-tracker miss as a SEPARATE finding — do NOT merge it into a reentrancy, drain, or access-control finding on the same function.
+        In the finding, name the exact loop function, the tracker variable, the cached value it governs, and the stale or zero recipient/value produced by the missing tracker write.
+        Assign confidence = 0.90 when: (1) the loop has a "skip re-fetch if key == prevKey" pattern, (2) prevKey is never reassigned inside the loop body, AND (3) the cached value (an address, a TBA address, a balance) is used directly in a transfer or safeTransferFrom call.
 
         When a record's baseline is initialized by copying the current value of a global, ever-growing running total or counter, verify the baseline semantics.
         Seeding a new record's score or reward baseline from the CURRENT global total rather than from zero gives that record a head-start equal to all prior activity: any later formula that computes the record's earned share as (current_total − baseline) under-reports for old records and over-reports for newly created ones, because the baseline was the accumulated total at creation time, not zero.
+        Report the baseline-from-global issue as a SEPARATE finding — do NOT merge it with function-pointer, governance, or score-manipulation findings on the same contract.
+        In the finding, name the initialization function, the global counter or accumulator it reads, and the downstream reward or score path that turns that seeded baseline into unearned credit.
+        Assign confidence = 0.90 when: (1) an initialization function sets a per-entity baseline by reading a global counter or max-score function rather than zero, AND (2) a downstream score/reward function EITHER computes earned share as (current_total − baseline), OR ADDS baseline to accumulated earned scores — in both cases the entity's computed score starts at or near the maximum without any participation. Example: baseline[entity][id] = globalMaxScore() where globalMaxScore() returns a running total, so score(entity) = globalMaxScore() + earnedScore(entity) = maximum immediately; the newly registered entity earns full rewards without any prior participation.
+
+        When a function A that controls critical state has any access restriction (onlyRole, require(msg.sender == dao), require(msg.sender == owner), or any named modifier), check whether the SAME state mutation is reachable through a less-protected path via two distinct patterns:
+        (a) If A calls an internal function _B to perform the state mutation, look for a SEPARATE public/external function C (distinct from A) that also calls _B — or directly performs the same storage write — without A's access restriction. Even if C is not a helper of A, calling C achieves the same state change that A is supposed to gate.
+        (b) If A calls a helper to perform a state mutation, check whether that helper is ALSO directly callable as a public/external function with no access check. Calling the helper directly skips A's gate entirely.
+        Report each as a SEPARATE access-control finding. In the finding, name the protected function, the less-protected entry point, the shared storage mutation, and the concrete critical state it changes. Assign confidence = 0.90 when: (1) function A has any access control (role, owner, or caller check), AND (2) the same state mutation is separately reachable via a public function that lacks that check, AND (3) the mutation advances critical state (validator lists, NFT state, governance scores, impact records, service registrations) without authorization.
+
+        In staking or deposit functions that accept a separate `receiver` address parameter, verify that delegation actions (vote delegation, validator registration) are only performed on behalf of msg.sender, not the arbitrary receiver. If the function calls _delegate(receiver, ...) or performs a registry registration on behalf of receiver without requiring msg.sender == receiver, any caller can redirect another holder's governance or attribution state by staking only a dust-sized amount on their behalf.
+        Report this as a SEPARATE finding. In the finding, name the staking/deposit function, the receiver parameter, the delegation or registration primitive it invokes, and the victim-controlled state it overwrites. Assign confidence = 0.90 when: (1) a staking function takes a receiver address that may differ from msg.sender, AND (2) the function calls _delegate(receiver, ...) or performs governance registration on behalf of receiver without require(msg.sender == receiver).
 
         Report concrete, proven cases with numerical evidence.
     </primary_targets>
@@ -741,6 +755,14 @@ SYSTEM_E = """
             (c) the dispatch loop's subcalls fail silently out-of-gas because the outer gas limit was set too low.
         The location field must name the public entry function, not the internal helper.
         Do NOT title this finding "unchecked call return", "silent failure", or "missing revert check" — those titles describe a return-value check pattern, not the external gas-calibration attack being reported here.
+        MANDATORY STEP-BY-STEP CHECK FOR GAS GRIEFING IN BATCH EXECUTORS: Before finalizing your finding list, perform these steps explicitly:
+            (A) Search for any public/external function that accepts a signed batch parameter (SignedBatchedCall, SignedBatch, UserOp, or any struct with a signature/wrappedSignature field and a calls/operations array).
+            (B) If found, check whether that function calls a signature verification helper (e.g., _handleVerifySignature, _verifySignature, _validateSignature, _checkSignature) BEFORE calling the dispatch function. Trace the FULL call chain — not just the immediate body.
+            (C) Inside that signature verification helper, check whether _useNonce(), consumeNonce(), incrementNonce(), or any nonce-advancing function is called. If yes, this nonce is permanently consumed on every call to the outer function.
+            (D) Check whether the batch struct or a caller parameter controls a shouldRevert / execType / revertOnFail / mode field that determines if subcall failures are silently swallowed (continue-on-error mode).
+            (E) Check whether the dispatch or _execute function forwards calls via a bare low-level `to.call{value: ...}(data)` or `to.call(data)` WITHOUT a `require(gasleft() > MIN_REQUIRED_GAS)` guard before the call.
+            If B+C+D+E are all true: this IS the exploitable gas-griefing/credential-burn pattern. You MUST include this finding with title "execute Calls Can Be Forced to Fail via Calibrated Gas Limit", vulnerability_type="gas_griefing_nonce_burn", confidence=0.90. Do NOT omit it.
+            The shouldRevert/continue-on-error mode field is NOT a mitigation — it is the mechanism that enables the attacker to consume the credential silently. The "Batch failure modes that are documented and handled by design" do_not_report bullet does NOT apply here — this attack abuses the EIP-150 63/64 gas retention rule to intentionally starve the subcall while the outer function succeeds and the nonce is permanently consumed.
         After any external call that consumes a granted resource, walk through every return path (success, partial-consume, revert-but-handled, early-return on insufficient balance) and verify the cleanup statement is actually reached on each.
         Function parameters that designate ownership of funds being moved should not be freely caller-controlled — when the caller can name any account whose funds the function operates on, the function may operate on accounts the caller has no relationship to.
         Spending authority granted by the contract to other contracts should be scoped to the immediate operation rather than to the maximum a token allows.
@@ -780,7 +802,7 @@ SYSTEM_E = """
         - Generic "gas griefing possible" without showing specific state permanently consumed
         - Cross-language differences that don't affect security (style, naming conventions)
         - Theoretical resource exhaustion without showing a concrete input that exceeds block limits
-        - Batch failure modes that are documented and handled by design
+        - Batch failure modes that are documented and handled by design (NOTE: this does NOT apply to the gas-griefing/credential-burn pattern described in the MANDATORY STEP-BY-STEP CHECK above — that attack is always reportable)
     </do_not_report>
 
     <dedup>
@@ -877,7 +899,7 @@ SYSTEM_SV = """
         A field that exists in the input struct but has no corresponding assignment in the function body cannot be updated by any caller of this function regardless of what value they supply — the stored field is permanently frozen at its initialization value.
         When both the input struct definition and the update function body are visible in this file, this check can be done with certainty: if the input has N named fields and the function body assigns only M < N of them, each of the N−M unassigned fields is a distinct finding.
         Assign confidence >= 0.90 when the struct definition is fully visible in this file; do NOT discount because other functions might update the field separately — check whether they do.
-        Title format: "Missing `<field_name>` in `<function_name>`: Input Struct Field Never Propagated to Stored State".
+        In the finding, name the missing input field, the handler that receives it, and the downstream protocol state that remains frozen because the field is never written through.
         Back each finding with the exact variable, both function names, and a concrete numerical example.
     </primary_targets>
 
@@ -1665,6 +1687,7 @@ PROMPT_ARITHMETIC = """
                         (1) a packing/encoding function branches between two output formats based on the exponent alone,
                         (2) a variable representing digit count or mantissa size is computed and available but NOT included in the branching condition, and
                         (3) the smaller-format branch divides the mantissa by a power of the base to truncate it — the truncated digits are permanently lost.
+                    ONE FINDING PER FUNCTION: if this exponent-only format-selection defect appears in MORE THAN ONE function, emit a SEPARATE finding for each affected function. Do NOT combine them into a single finding that names multiple functions. Use a per-function title such as "[functionName] Selects Encoding Format Based Solely on Exponent, Silently Truncating Mantissa Digits When Digit Count Falls Between Format Capacities".
     </method>
 
     <do_not_report>
@@ -1724,9 +1747,9 @@ PROMPT_DEX_INTEGRATION = """
                 (e) For contracts that call a combined liquidity-removal-and-fee-collection function on a concentrated-liquidity pool in a single external call, verify that ALL returned token amounts are fully used.
                     Such functions typically return two sets of amounts: tokens removed from the position (principal) and separately accrued fee tokens.
                     If downstream logic uses only the principal amounts for a subsequent swap or transfer while fee amounts are merely recorded in an event and never transferred, swapped, or re-invested, the fee tokens accumulate in the calling contract with no extraction path.
-                    Evaluate each token independently: if the combined call returns principal and collected amounts for two tokens (e.g., a protocol token and a stablecoin), it is still a fee-stranding vulnerability when only one token's fee portion is stranded even if the other token's fees are correctly burned or transferred.
-                    A function that burns the total collected amount of one token (correct) but routes only the principal amount of the other token through a swap while the fee difference for that second token is emitted in an event without being transferred or swapped — permanently strands the second token's fees in the calling contract.
-                    Assign confidence = 0.95 when confirmed.
+                    Evaluate each token independently: if the combined call returns principal and collected amounts for two tokens, it is still a fee-stranding vulnerability when only one token's fee portion is stranded even if the other token's fees are correctly burned or transferred.
+                    The key invariant is simple: whenever an external call returns both principal and total-collected amounts, downstream logic must either consume the total-collected amounts or explicitly account for the fee delta. If the code uses only the principal values while the fee delta is merely logged, cached, or ignored, those fees are stranded.
+                    In the finding, name the exit/rebalancing function, the returned principal values, the returned collected values, and the exact token whose fee delta is left unused. Assign confidence = 0.95 when confirmed.
                     This same accounting failure arises in the SEPARATED two-call pattern: when a position-management function calls
                         (A) a decrease-liquidity or burn operation that returns the principal amounts owed, then
                         (B) a separate collect call that returns the total amounts owed (principal + all accrued fees), but downstream logic uses only the decrease-liquidity/burn return values while discarding the collect return values.
@@ -1747,6 +1770,11 @@ PROMPT_DEX_INTEGRATION = """
             In Uniswap V3-style concentrated liquidity pools, using IERC20.balanceOf(pool) as the denominator in a liquidity computation is structurally incorrect even apart from manipulation: the pool holds tokens from ALL active tick-range positions, not only the AMO's current tick range. A formula of `liquidity = inputAmount * currentLiquidity / balanceOf(pool)` systematically underestimates the correct liquidity because currentLiquidity covers only the active range while balanceOf(pool) is inflated by every other position.
             This structural error is present regardless of whether the balance is manipulated, and compounds with manipulation to produce large deviations.
             Assign confidence = 0.90 when the liquidity estimation reads IERC20.balanceOf(pool) or pool.token0Balance() / pool.token1Balance() as the denominator while dividing by pool.liquidity() or slot0.sqrtPriceX96 (the active-range liquidity), since balanceOf covers all positions across all tick ranges while liquidity covers only the active range — these two quantities are not proportional and cannot be used together to derive a correct liquidity delta.
+            For every function that adds liquidity, perform these steps explicitly:
+                (1) Locate the line that assigns the `liquidity` variable (or equivalent) inside the add-liquidity function.
+                (2) Check whether the formula divides by `IERC20.balanceOf(pool)`, `IERC20Upgradeable(usd).balanceOf(pool)`, `IERC20(token).balanceOf(poolAddress)`, or any equivalent token-balance-of-pool call.
+                (3) If yes, verify the pool is V3-style (has tick ranges, ISolidlyV3Pool / IUniswapV3Pool / ICLPool, or uses `pool.liquidity()` to read active-range liquidity).
+                (4) If both (2) and (3) are true, report the finding and explain why total pool balances and active-range liquidity are not proportional quantities.
         CHECK 6 — MULTI-STEP FILL AND REFUND ACCOUNTING:
             In functions routing through multiple pools sequentially, when a step fills less than requested, verify what is debited from the caller and what is refunded reconcile against what was actually consumed.
             Refunding a difference that was never debited lets the caller pay nothing or receive free tokens.
@@ -1870,17 +1898,17 @@ ANCHOR_LANG_HINT = """
             When an instruction passes an UncheckedAccount (no seeds, no owner constraint) as a writable argument to an external program's `create_*` / `init_*` CPI, the external program initializes that account.
             Because the address is derivable on-chain (pool key, mint, owner), an attacker can call the external program's create instruction directly BEFORE this instruction runs.
             The account is then already initialized and this instruction's CPI fails permanently. Report every such (UncheckedAccount, create_* CPI) pair.
-            This pattern applies equally to raw `invoke_signed` calls where the instruction is constructed manually: if the `data` field is computed from a function-name discriminator (e.g., `get_function_hash("global", "create_lock_escrow")` or any function-hash helper whose string argument contains "create", "init", or "lock"), treat the call as a `create_*` CPI.
+            This pattern applies equally to raw `invoke_signed` calls where the instruction is constructed manually: if the `data` field is computed from a function-name discriminator (e.g., any function-hash helper whose string argument contains "create", "init", or "lock"), treat the call as a `create_*` CPI.
             The target account's seeds do NOT need to be visible in the current file: if the account is `UncheckedAccount<'info>` and is passed as writable to an external `create_*` instruction, and the seed inputs to that create call are derived from publicly-visible accounts already present in the instruction's account context (pool.key(), fee_receiver.key(), lp_mint.key(), or equivalent), an attacker can derive the PDA address externally and pre-create it.
             Assign confidence = 0.90 when all three conditions hold: the target account is declared with no seeds, owner, or program constraint (UncheckedAccount or equivalent), it is passed writable to an external create_* or init_* CPI (including raw invoke_signed with a create-named discriminator), and its address is derivable from publicly-known on-chain parameters visible in the accounts passed to this instruction.
             This is a CRITICAL severity finding — once the account is pre-created, every future invocation of the parent instruction fails permanently with no recovery path.
             Title this finding "[instruction_name] is Permanently DoS-able via Pre-Creation of [account_name]" or "CPI DoS: Pre-Created [account_name] Blocks [instruction_name]" — the title must name both the blocked instruction and the specific account that can be pre-created.
-            Report EACH (UncheckedAccount, create_* CPI) pair as a SEPARATE finding: if one instruction contains two separate create_* CPIs (e.g., one for create_pool and another for create_lock_escrow), emit two findings — one per account — even if they share the same instruction context.
+            Report EACH (UncheckedAccount, create_* CPI) pair as a SEPARATE finding: if one instruction contains two separate create_* CPIs (e.g., one for create_pool and another for create_escrow), emit two findings — one per account — even if they share the same instruction context.
             CRITICAL DISTINCTION — do not let a different UncheckedAccount vulnerability suppress this finding: in a raw invoke_signed call, the PROGRAM ACCOUNT being UncheckedAccount is a DIFFERENT vulnerability (arbitrary CPI / code injection).
             The TARGET ACCOUNT being UncheckedAccount (the account that the external program will initialize as a new PDA) is the PDA pre-creation DoS vulnerability described here.
             Both findings are valid and must be reported INDEPENDENTLY.
-            If lock_pool.rs passes `meteora_program` as an UncheckedAccount program (arbitrary program injection) AND passes `lock_escrow` as an UncheckedAccount target to a create_lock_escrow CPI, you must report TWO findings: one for the arbitrary-program vulnerability and a SEPARATE one titled "lock_pool is Permanently DoS-able via Pre-Creation of lock_escrow".
-            Do NOT suppress the lock_escrow finding just because you already reported the meteora_program finding.
+            Example: if an instruction passes an UncheckedAccount program AND a separate UncheckedAccount target account to a create_* CPI, you must report TWO findings — one for the arbitrary-program injection vulnerability and a SEPARATE one for the pre-creation DoS on the target account.
+            Do NOT suppress the escrow/target-account DoS finding just because you already reported the program-injection finding.
         - `has_one` and `constraint` annotations validate account relationships.
             Missing ones allow forged accounts to satisfy account-context typing while carrying attacker-controlled data.
         - Protocol-wide config / state accounts aggregate totals.
@@ -5127,6 +5155,6 @@ if __name__ == '__main__':
     time.sleep(10)
     fetch_projects()
     inference_api = 'http://localhost:8087'
-    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/sherlock_axion_2025_01'
+    project = sys.argv[1] if len(sys.argv) > 1 else 'projects/code4rena_forte-float128-solidity-library_2025_04'
 
     report = agent_main(project, inference_api=inference_api)
