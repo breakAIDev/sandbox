@@ -132,22 +132,6 @@ def miner_run_no_docker():
     asyncio.run(manager.run())
 
 
-@miner_app.command("benchmark")
-def miner_benchmark(
-    agent_path: str = Option("miner/3.1.4/agent_3.1.4_v1.py", help="Agent file to benchmark locally"),
-    projects: str = Option(
-        "cantina_minimal-delegation_2025_04,code4rena_forte-float128-solidity-library_2025_04",
-        help="Comma-separated local project subset",
-    ),
-):
-    """Run one local benchmark pass against a chosen agent file and project subset."""
-    os.environ["LOCAL"] = "true"
-    os.environ["LOCAL_AGENT_PATH"] = str(Path(agent_path).resolve())
-    os.environ["LOCAL_PROJECT_KEYS"] = ",".join([p.strip() for p in projects.split(",") if p.strip()])
-    manager = SandboxManager(is_local=True)
-    asyncio.run(manager.run())
-
-
 @miner_app.command("execute-agent")
 def miner_execute_agent():
     """Run the miner agent script locally on a single project."""

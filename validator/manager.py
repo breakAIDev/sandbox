@@ -119,7 +119,7 @@ class SandboxManager:
             return
 
         if self.is_local:
-            agent_filepath = os.getenv("LOCAL_AGENT_PATH") or f"{settings.host_cwd}/miner/agent.py"
+            agent_filepath = f"{settings.host_cwd}/miner/agent.py"
             agent_filepath = os.path.abspath(agent_filepath)
 
         else:

@@ -245,15 +245,8 @@ class MockPlatformClient:
             "code4rena_pump-science_2025_02",
             "code4rena_virtuals-protocol_2025_08",
         ]
-        project_keys_env = os.getenv("LOCAL_PROJECT_KEYS", "").strip()
-        project_keys = (
-            [p.strip() for p in project_keys_env.split(",") if p.strip()]
-            if project_keys_env
-            else default_project_keys
-        )
-
         agent = {
-            "project_keys": project_keys,
+            "project_keys": default_project_keys,
             "execution_api_key": execution_api_key,
         }
         return agent
