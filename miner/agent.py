@@ -41,6 +41,8 @@ CONF_SCAN_FALLBACK    = 0.50    # scan path
 
 MAX_FILES_TO_ANALYZE = 30
 MAX_FILE_CAP = 18
+TOP_RANKED_FILE_COUNT = 6
+RELATED_FILE_CAP = 5
 
 # PRIMARY_MODEL is the high-volume scan model. It runs analyze_file() with all specialized
 # prompts intact. A fast non-reasoning instruct model is used here for scan throughput;
@@ -3801,9 +3803,9 @@ PROTOCOL MODEL CONTEXT
         return sorted(files, key=score)
 
     def find_related_files(self, file_path: Path, files_in_scope: list[Path], source_dir: Path, import_graph: dict | None = None) -> list[str]:
-        """Return paths (relative strings) of files that import or are imported by file_path.
-        Uses the pre-computed import graph from rank_files_by_imports when available,
-        otherwise falls back to a quick grep of the file's own import statements."""
+        """Return nearby dependency paths (relative strings) for file_path.
+        Uses the pre-computed import graph from rank_files_by_imports when available;
+        otherwise falls back to resolving the file's own import statements."""
 
         related: list[str] = []
 
@@ -3852,7 +3854,7 @@ PROTOCOL MODEL CONTEXT
             except Exception:
                 pass
 
-        return related[:5]
+        return related[:RELATED_FILE_CAP]
 
     def _llm_cluster_chunk(self, chunk: list, model: str) -> list:
         """Ask the LLM to identify duplicate groups within one chunk of findings.
@@ -4443,10 +4445,10 @@ PROTOCOL MODEL CONTEXT
         whatever is left.  Deferred Phase 1/2 collection may consume part of the
         verifier window, so the effective verifier and merge slots vary per run.
 
-        Phase 0 : Protocol model on all ranked files (THINKING_MODEL, serial background)
-        Phase 1 : Tier 2 breadth — A1-A4, B for all files (thinking off)
-        Phase 2 : Tier 3-4 depth — role-filtered prompts per file, JSON_MODEL
-        Phase 4 : Agentic deep-dive on top-5 files (ROUTER_MODEL) — runs BEFORE Phase 3;
+        Phase 0 : Protocol model on the scan-phase ranked set (capped by MAX_FILE_CAP)
+        Phase 1 : Tier 2 breadth — A1-A4, B across the scan-phase ranked set
+        Phase 2 : Tier 3-4 depth — role-filtered prompts per file in the scan-phase ranked set
+        Phase 4 : Agentic deep-dive on ranked_files[:TOP_RANKED_FILE_COUNT] (ROUTER_MODEL) — runs BEFORE Phase 3;
                   requires ≥90 s remaining so the deep-dive is never starved by Phase 3
         Phase 3 : Two-pass at temperature=0.15 for recall diversity — runs only if
                   ≥120 s remain after Phase 4; lower priority than the deep-dive
@@ -4676,7 +4678,7 @@ PROTOCOL MODEL CONTEXT
 
         try:
             # ----------------------------------------------------------------
-            # Phase 0: Protocol model for ALL ranked files — background parallel.
+            # Phase 0: Protocol model for all files in ranked_files — background parallel.
             # max_workers=2: THINKING_MODEL (qwen3-235b-a22b-thinking-2507) handles
             # 2 concurrent requests without triggering 502s on the upstream provider.
             #
@@ -4685,9 +4687,8 @@ PROTOCOL MODEL CONTEXT
             # compete.  Results are consumed as a snapshot at Phase 2/4 submission
             # time via _get_proto_out(): if a file's future is done when Phase 2 is
             # submitted (~8 min in), that file gets protocol context; otherwise it
-            # falls back to defaults.  Early-ranked files benefit most because Phase 0
-            # processes files in ranked order and Phase 2 is submitted after the
-            # Phase 1 split window.
+            # falls back to defaults. ranked_files is the scan-phase set capped by
+            # MAX_FILE_CAP, and Phase 2 is submitted after the Phase 1 split window.
             # ----------------------------------------------------------------
             PHASE1_SPLIT_SECS = 8 * 60
             PHASE4_RESERVE = 240
@@ -4717,7 +4718,7 @@ PROTOCOL MODEL CONTEXT
                 return {}
 
             # ----------------------------------------------------------------
-            # Phase 1: Tier 2 breadth — A1-A4 + B, all files, thinking OFF (PRIMARY_MODEL, tb=0).
+            # Phase 1: Tier 2 breadth — A1-A4 + B across ranked_files, thinking OFF (PRIMARY_MODEL, tb=0).
             # SYSTEM_A1 on AMM-detected files gets tb=4096 (dynamic thinking enabled).
             # Starts immediately (parallel with Phase 0 background worker).
             # Submitted file-major (all prompts for file1, then file2, ...).
@@ -4733,7 +4734,7 @@ PROTOCOL MODEL CONTEXT
             # ----------------------------------------------------------------
             tier2_futures: list = []
 
-            _phase1_order = sorted(ranked_files, key=lambda fp: fp.stat().st_size, reverse=True)
+            _phase1_order = sorted(ranked_files, key=lambda fp: fp.stat().st_size)
 
             for fp in _phase1_order:
                 rel = str(fp.relative_to(source_dir))
@@ -4850,7 +4851,7 @@ PROTOCOL MODEL CONTEXT
                     deferred_scan_futures.append(f)
 
             # ----------------------------------------------------------------
-            # Phase 4: Agentic deep-dive on top-5 files (ROUTER_MODEL).
+            # Phase 4: Agentic deep-dive on ranked_files[:TOP_RANKED_FILE_COUNT] (ROUTER_MODEL).
             # Runs BEFORE Phase 3 — requires ≥180 s remaining before scan_deadline.
             # Runs whenever time_remaining > 180 — not gated on Phase 1/2 completion.
             # The 4-minute reserve built into phase1_cutoff guarantees
@@ -4859,14 +4860,14 @@ PROTOCOL MODEL CONTEXT
             time_remaining = scan_deadline - time.time()
 
             if time_remaining > 180:
-                top5 = ranked_files[:5]
+                top_ranked = ranked_files[:TOP_RANKED_FILE_COUNT]
                 ag_mono_deadline = time.monotonic() + min(time_remaining, 5 * 60)
 
                 # Pre-compute per-file lang_hint and protocol_context.
                 # file_texts is already populated; _get_proto_out() returns Phase 0 results
                 # that are complete by now (Phase 0 runs in parallel with Phase 1).
                 _ag_file_ctx: dict[Path, tuple[str, str]] = {}
-                for fp in top5:
+                for fp in top_ranked:
                     rel = str(fp.relative_to(source_dir))
                     _content = file_texts.get(fp, "")
                     _lh = ""
@@ -4886,7 +4887,7 @@ PROTOCOL MODEL CONTEXT
                     _pc = _fmt_protocol_context(_get_proto_out(rel))
                     _ag_file_ctx[fp] = (_lh, _pc)
 
-                ag_executor = ThreadPoolExecutor(max_workers=len(top5))
+                ag_executor = ThreadPoolExecutor(max_workers=len(top_ranked))
                 ag_futures = {
                     ag_executor.submit(
                         self._run_agentic_pass, source_dir,
@@ -4894,7 +4895,7 @@ PROTOCOL MODEL CONTEXT
                         *_ag_file_ctx[fp]
                     ): fp
 
-                    for i, fp in enumerate(top5)
+                    for i, fp in enumerate(top_ranked)
                 }
 
                 try:
