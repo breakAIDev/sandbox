@@ -1990,11 +1990,12 @@ GENERIC_LANG_HINT_BY_EXT = {
 # order: preferred providers ranked by reliability + throughput from production run analysis.
 _PROVIDER_ROUTING: dict[str, dict] = {
     THINKING_MODEL: {
-        # deepinfra/atlas-cloud/novita: 32K max_completion cap — too low for Phase 4 large-context calls (7-8K input)
-        # alibaba: max_completion=null + ignores budget_tokens → 82K+ output observed (Jun 2026 Phase 4, 8379 in → 82158 out)
-        # wandb: only available provider with 262K max_completion that honors budget_tokens
-        "ignore": ["deepinfra", "alibaba", "atlas-cloud", "novita"],
-        "order": ["wandb"],
+        # Current OpenRouter endpoints for qwen3-235b-a22b-thinking are Alibaba,
+        # DeepInfra, and Novita.  DeepInfra supports reasoning + response_format
+        # with a bounded max_tokens path, which is sufficient for Phase 0 and the
+        # verifier.  Novita does not advertise response_format for this model.
+        "ignore": ["novita"],
+        "order": ["alibaba", "deepinfra"],
     },
     PRIMARY_MODEL: {
         # ambient: 25-46 tok/s; io-net: silent TCP failures; siliconflow: 17 tok/s; wandb: 32K hard cap
@@ -2837,8 +2838,13 @@ class BaselineRunner:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": _max_tokens,
-            "thinking": {"type": "enabled", "budget_tokens": thinking_budget} if thinking_budget > 0 else {"type": "disabled"},
         }
+
+        if self.inference_api_key.startswith("sk-or-"):
+            if thinking_budget > 0 and used_model == THINKING_MODEL:
+                payload["reasoning"] = {"max_tokens": thinking_budget}
+        else:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget} if thinking_budget > 0 else {"type": "disabled"}
 
         if used_model in _PROVIDER_ROUTING:
             payload["provider"] = _PROVIDER_ROUTING[used_model]
