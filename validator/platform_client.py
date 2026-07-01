@@ -248,6 +248,7 @@ class MockPlatformClient:
         agent = {
             "project_keys": default_project_keys,
             "execution_api_key": execution_api_key,
+            "eval_max_vulns": 80,
         }
         return agent
 
