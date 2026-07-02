@@ -173,6 +173,11 @@ class APIPlatformClient:
         resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
 
+    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict[str, Any]) -> dict:
+        endpoint = f"jobs/runs/{job_run_id}/proxy-summary"
+        resp = self._call_api("post", endpoint, json=payload, authenticate=True)
+        return resp
+
     def start_job_run(self, job_run_id: int) -> dict:
         endpoint = f"jobs/runs/{job_run_id}/start"
         resp = self._call_api("post", endpoint, authenticate=True)
@@ -227,6 +232,10 @@ class MockPlatformClient:
 
         return _method
 
+    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict[str, Any]) -> dict:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return {"id": 1}
+
     def get_job_run_agent(self, job_run_id: int):
         execution_api_key = settings.inference_api_key
         default_project_keys = [
@@ -248,7 +257,7 @@ class MockPlatformClient:
         agent = {
             "project_keys": default_project_keys,
             "execution_api_key": execution_api_key,
-            "eval_max_vulns": 80,
+            "eval_max_vulns": 100,
         }
         return agent
 
