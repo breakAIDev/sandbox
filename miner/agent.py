@@ -247,20 +247,11 @@ SYSTEM_A4 = _SYSTEM_A_COMMON_HEADER + """
 
         When the protocol stores a record linking deposited funds to an intended beneficiary, trace every payout, claim, and unstake path that touches those funds and verify each path consults the link before deciding the destination.
 
-        When a loop caches a value to avoid re-fetching on every iteration — e.g. it skips a storage read when the current item's key equals the previous item's key — verify two things. First, EVERY state variable written in the first-encounter (non-cached) path is also written in the cached path;
-        a cache-hit branch that advances a primary counter but skips a secondary write silently leaves that secondary variable pointing at the previous item's data for all later cached iterations.
-        Second, the tracking key the skip condition compares against is reassigned at the end of every iteration;
-        a tracker that is never updated stays at its initialization value (commonly 0 / the zero address), so the skip either never fires, or fires on the very first item when the input matches that sentinel — dispatching funds or state through the still-uninitialized variable to the zero address.
-        Walk every storage write in the loop body and confirm the tracker is among them.
-        Report the loop-tracker miss as a SEPARATE finding — do NOT merge it into a reentrancy, drain, or access-control finding on the same function.
-        In the finding, name the exact loop function, the tracker variable, the cached value it governs, and the stale or zero recipient/value produced by the missing tracker write.
-        Assign confidence = 0.90 when: (1) the loop has a "skip re-fetch if key == prevKey" pattern, (2) prevKey is never reassigned inside the loop body, AND (3) the cached value (an address, a TBA address, a balance) is used directly in a transfer or safeTransferFrom call.
+        When a loop caches a derived value across iterations, verify that the cached value and the key that validates it are advanced together on every branch. If one changes without the other, later iterations may use stale or uninitialized data for balance updates, destinations, or external calls.
+        Walk every storage write in the loop body and confirm loop-control variables are updated on all paths.
+        Report the loop-cache issue separately when it has a direct value-moving or authority impact.
 
-        When a record's baseline is initialized by copying the current value of a global, ever-growing running total or counter, verify the baseline semantics.
-        Seeding a new record's score or reward baseline from the CURRENT global total rather than from zero gives that record a head-start equal to all prior activity: any later formula that computes the record's earned share as (current_total − baseline) under-reports for old records and over-reports for newly created ones, because the baseline was the accumulated total at creation time, not zero.
-        Report the baseline-from-global issue as a SEPARATE finding — do NOT merge it with function-pointer, governance, or score-manipulation findings on the same contract.
-        In the finding, name the initialization function, the global counter or accumulator it reads, and the downstream reward or score path that turns that seeded baseline into unearned credit.
-        Assign confidence = 0.90 when: (1) an initialization function sets a per-entity baseline by reading a global counter or max-score function rather than zero, AND (2) a downstream score/reward function EITHER computes earned share as (current_total − baseline), OR ADDS baseline to accumulated earned scores — in both cases the entity's computed score starts at or near the maximum without any participation. Example: baseline[entity][id] = globalMaxScore() where globalMaxScore() returns a running total, so score(entity) = globalMaxScore() + earnedScore(entity) = maximum immediately; the newly registered entity earns full rewards without any prior participation.
+        When a new record copies an existing aggregate or accumulator, verify that value has the same meaning downstream. A newly-created participant or service record should not inherit prior activity unless the protocol explicitly intends it. Report this as unsafe initial state, separate from generic score manipulation.
 
         When a function A that controls critical state has any access restriction (onlyRole, require(msg.sender == dao), require(msg.sender == owner), or any named modifier), check whether the SAME state mutation is reachable through a less-protected path via two distinct patterns:
         (a) If A calls an internal function _B to perform the state mutation, look for a SEPARATE public/external function C (distinct from A) that also calls _B — or directly performs the same storage write — without A's access restriction. Even if C is not a helper of A, calling C achieves the same state change that A is supposed to gate.
@@ -404,7 +395,7 @@ SYSTEM_B = """
             (2) no access control prevents arbitrary callers from invoking the recalculation at any time, then a malicious participant can observe the admin's parameter-change transaction and immediately call the recalculation on their own records to bias the output in their favor before the effect is locked in.
         Assign confidence = 0.85 when a public recalculation function takes a record identifier as input and reads an admin-configurable multiplier to rewrite a stored financial value that feeds into reward distribution, service scoring, or voting power attribution.
         For public (ungated) functions that execute multi-step financial operations — flashloans, pool rebalancing, arbitrage, price correction — and accept caller-supplied numeric parameters (direction flags, amounts, output targets) that the protocol intends to be derived from a specific oracle or preview function: verify that the function validates the parameters match the expected values or constraints.
-        If a public rebalancing or arbitrage function accepts a direction flag (e.g., directionMask, zeroForOne, sellBuy) and amount parameters without checking that these were computed by the corresponding preview or quote function, an attacker can supply arbitrary values that:
+        If a public rebalancing or arbitrage function accepts a direction flag (for example buy/sell side or token-in/token-out side) and amount parameters without checking that these were computed by the corresponding preview or quote function, an attacker can supply arbitrary values that:
             (a) pass the wrong direction flag (not 0 or the designated "sell" constant) causing a flashloan for the wrong direction that leaves the pool MORE unbalanced rather than restoring peg, OR
             (b) supply amounts that mismatch current pool state, causing the flashloan to revert or complete in a direction opposite to the protocol's rebalancing goal.
         Assign confidence = 0.85 when a public rebalancing, arbitrage, or peg-restoration function accepts numeric control parameters (direction flag, amount in, amount out) without any validation that they correspond to the current previewRebalance(), previewSwap(), or equivalent oracle output.
@@ -734,7 +725,8 @@ SYSTEM_E = """
         Verify that subcalls are guaranteed enough gas, that state writes happen at the right point relative to external calls, and that resource handles (allowances, flags, nonces) are reset on every exit path — including the path where the subcall consumed only part of the granted resource.
         A specific high-value shape: a multi-step entry point consumes a single-use credential up front (a nonce, a one-time permit, a lock flag) and then dispatches to an inner sub-call whose failure is NOT propagated as a top-level revert (it is swallowed, returned as a bool, or run under a caller-selected mode).
         Because the EVM withholds a fixed portion of the remaining gas at every call boundary, an external caller who sets the outer transaction's gas limit can starve the inner sub-call so it runs out of gas and fails, while the entry point's prologue and epilogue still complete — so the credential is burnt and the user's intended action silently does not happen.
-        Flag every (credential-consumed-up-front, inner sub-call, non-reverting failure) triple where the caller controls the gas.
+        Gas-budget framing: when the failure depends on transaction gas, explain the EIP-150 63/64 gas-forwarding constraint in your own words. The important lifecycle issue is that the submitter can choose a tight gas limit so authorization and single-use state consumption complete, but the later inner dispatch has too little gas; if the public entry keeps the batch successful or fails to restore the consumed state, the signer cannot replay the intended operation.
+        Flag every credential-consumed-up-front, inner sub-call, non-reverting failure combination where the caller controls the execution resource budget.
         The "non-reverting failure" trigger is especially common in batch execution contracts that expose a boolean or mode parameter controlling whether the batch reverts on subcall failure — when this parameter is set to "continue on error" mode, a sub-call failure inside the batch does NOT bubble up as a top-level revert; the error is swallowed and the batch carries on.
         An attacker submits the signed batch with a gas limit large enough for the prologue (signature check, nonce consumption) to succeed, but insufficient for one or more inner calls once the EVM-retained portion is withheld at the subcall boundary.
         The nonce is consumed, the batch "succeeds" at the outer level, and the user's intended action silently failed. Check:
@@ -747,24 +739,8 @@ SYSTEM_E = """
             In this attack, the signature IS valid and validates correctly — the nonce consumption is legitimate and intended.
             The exploit does not rely on signature failure; it relies on the fact that after a SUCCESSFUL signature check and nonce consumption, the attacker supplies a calibrated gas limit that leaves too little gas for the dispatch loop's subcalls.
             Do NOT conflate these two bugs: if you find that "nonce is consumed before signature validation" (where the nonce burns on signature failure), that is a different vulnerability from the gas-grief attack (where the nonce burns after successful validation but subcalls are gas-starved).
-        Frame the finding as a gas-griefing/credential-burn exploit, not a state-propagation or missing-field bug — the attacker calibrates the outer call's gas limit so the inner subcall is starved while the credential has already been consumed and the outer call returned success.
-        MANDATORY TITLE FORMAT: use "[entry_function] Calls Can Be Forced to Fail via Calibrated Gas Limit" where [entry_function] is the PUBLIC/EXTERNAL function the attacker calls directly — the function whose name appears in the ABI and that an external caller can invoke by name (e.g., execute, executeWithSig, executeBatch, executeCall).
-        The [entry_function] MUST NOT be an internal helper such as _useNonce, _handleVerifySignature, _validateSignature, or _dispatch — those are called by the entry function but are never themselves the attack vector. If _useNonce or _handleVerifySignature is called from execute(SignedBatchedCall, wrappedSignature), then [entry_function] = "execute".
-        MANDATORY vulnerability_type: "gas_griefing_nonce_burn".
-        The description MUST explicitly state that:
-            (a) the attacker calls [entry_function] directly with a calibrated outer gas limit,
-            (b) signature validation and nonce/credential consumption succeed inside the entry function, and
-            (c) the dispatch loop's subcalls fail silently out-of-gas because the outer gas limit was set too low.
-        The location field must name the public entry function, not the internal helper.
-        Do NOT title this finding "unchecked call return", "silent failure", or "missing revert check" — those titles describe a return-value check pattern, not the external gas-calibration attack being reported here.
-        MANDATORY STEP-BY-STEP CHECK FOR GAS GRIEFING IN BATCH EXECUTORS: Before finalizing your finding list, perform these steps explicitly:
-            (A) Search for any public/external function that accepts a signed batch parameter (SignedBatchedCall, SignedBatch, UserOp, or any struct with a signature/wrappedSignature field and a calls/operations array).
-            (B) If found, check whether that function calls a signature verification helper (e.g., _handleVerifySignature, _verifySignature, _validateSignature, _checkSignature) BEFORE calling the dispatch function. Trace the FULL call chain — not just the immediate body.
-            (C) Inside that signature verification helper, check whether _useNonce(), consumeNonce(), incrementNonce(), or any nonce-advancing function is called. If yes, this nonce is permanently consumed on every call to the outer function.
-            (D) Check whether the batch struct or a caller parameter controls a shouldRevert / execType / revertOnFail / mode field that determines if subcall failures are silently swallowed (continue-on-error mode).
-            (E) Check whether the dispatch or _execute function forwards calls via a bare low-level `to.call{value: ...}(data)` or `to.call(data)` WITHOUT a `require(gasleft() > MIN_REQUIRED_GAS)` guard before the call.
-            If B+C+D+E are all true: this IS the exploitable gas-griefing/credential-burn pattern. You MUST include this finding with title "execute Calls Can Be Forced to Fail via Calibrated Gas Limit", vulnerability_type="gas_griefing_nonce_burn", confidence=0.90. Do NOT omit it.
-            The shouldRevert/continue-on-error mode field is NOT a mitigation — it is the mechanism that enables the attacker to consume the credential silently. The "Batch failure modes that are documented and handled by design" do_not_report bullet does NOT apply here — this attack abuses the EIP-150 63/64 gas retention rule to intentionally starve the subcall while the outer function succeeds and the nonce is permanently consumed.
+        Frame the finding as a resource-controlled single-use request failure, not a state-propagation or missing-field bug. The location field should name the public entry function, not only the internal helper.
+        Before finalizing this class, verify the public entry authorizes a request, consumes single-use state, dispatches later work, and can leave the consumed state unrecovered when the dispatch fails or is skipped.
         After any external call that consumes a granted resource, walk through every return path (success, partial-consume, revert-but-handled, early-return on insufficient balance) and verify the cleanup statement is actually reached on each.
         Function parameters that designate ownership of funds being moved should not be freely caller-controlled — when the caller can name any account whose funds the function operates on, the function may operate on accounts the caller has no relationship to.
         Spending authority granted by the contract to other contracts should be scoped to the immediate operation rather than to the maximum a token allows.
@@ -1769,14 +1745,9 @@ PROMPT_DEX_INTEGRATION = """
             For any function that computes a liquidity delta, verify the formula matches what the underlying pool expects, including the correct single-sided formula for the current price's position relative to the range.
             Additionally, for AMO or rebalancing contracts that contain a function (with or without arguments) that estimates how much liquidity to add or remove using live pool token balances (e.g., reading IERC20.balanceOf(pool) to derive the imbalance and then computing a liquidity delta from that imbalance): verify those balance inputs are not externally manipulable.
             Live pool token balances can be altered by anyone donating tokens directly to the pool address or executing flash transactions that temporarily shift the pool state — if the estimation formula feeds directly from these balances, an adversary can front-run the AMO's rebalancing call to skew the estimated liquidity amount, causing the protocol to over-burn or under-burn position liquidity.
-            In Uniswap V3-style concentrated liquidity pools, using IERC20.balanceOf(pool) as the denominator in a liquidity computation is structurally incorrect even apart from manipulation: the pool holds tokens from ALL active tick-range positions, not only the AMO's current tick range. A formula of `liquidity = inputAmount * currentLiquidity / balanceOf(pool)` systematically underestimates the correct liquidity because currentLiquidity covers only the active range while balanceOf(pool) is inflated by every other position.
+            In range-based liquidity pools, using the full pool token balance as the denominator for one position's liquidity computation is structurally unsafe unless the code proves the balance and liquidity measure the same range and ownership scope. The pool balance can include assets from many positions, while an active-liquidity value may cover only the current range.
             This structural error is present regardless of whether the balance is manipulated, and compounds with manipulation to produce large deviations.
-            Assign confidence = 0.90 when the liquidity estimation reads IERC20.balanceOf(pool) or pool.token0Balance() / pool.token1Balance() as the denominator while dividing by pool.liquidity() or slot0.sqrtPriceX96 (the active-range liquidity), since balanceOf covers all positions across all tick ranges while liquidity covers only the active range — these two quantities are not proportional and cannot be used together to derive a correct liquidity delta.
-            For every function that adds liquidity, perform these steps explicitly:
-                (1) Locate the line that assigns the `liquidity` variable (or equivalent) inside the add-liquidity function.
-                (2) Check whether the formula divides by `IERC20.balanceOf(pool)`, `IERC20Upgradeable(usd).balanceOf(pool)`, `IERC20(token).balanceOf(poolAddress)`, or any equivalent token-balance-of-pool call.
-                (3) If yes, verify the pool is V3-style (has tick ranges, ISolidlyV3Pool / IUniswapV3Pool / ICLPool, or uses `pool.liquidity()` to read active-range liquidity).
-                (4) If both (2) and (3) are true, report the finding and explain why total pool balances and active-range liquidity are not proportional quantities.
+            For every function that computes a liquidity delta, verify the numerator and denominator measure the same domain: same position range, same asset side, same time point, and same ownership scope. Reject formulas that mix position-scoped quantities with venue-wide balances or aggregate liquidity unless the code normalizes them into the same domain before use.
         CHECK 6 — MULTI-STEP FILL AND REFUND ACCOUNTING:
             In functions routing through multiple pools sequentially, when a step fills less than requested, verify what is debited from the caller and what is refunded reconcile against what was actually consumed.
             Refunding a difference that was never debited lets the caller pay nothing or receive free tokens.
@@ -1885,6 +1856,19 @@ PROTOCOL_MODEL_PROMPT = """
         - SYSTEM_C              → skip when file has no cross-contract ABI dependencies or unit conversions
         - SYSTEM_D              → skip when file has no complex math, loops, or type-casting
 
+    For high-risk files, do NOT skip PROMPT_VALUE_DEPENDENCY, PROBE_HELPER_CALLER,
+    PROMPT_DELEGATED_EXECUTION, PROMPT_ONBOARDING_CASCADE, or PROMPT_NUMERIC_BOUNDARY
+    when those prompt names exist in the pipeline, unless the file is ABI-only/interface-only
+    or has no executable logic. A skip means structurally impossible, not merely unlikely.
+
+    Do NOT skip PROBE_HELPER_CALLER when the file has loop trackers, cached ids,
+    cached recipients, helper-returned amounts, refund/remainder calculations, or state
+    variables reused across iterations.
+
+    Do NOT skip PROMPT_VALUE_DEPENDENCY when the file reads balances, scores, prices,
+    reserves, liquidity, voting power, validator scores, or token-bound account addresses
+    and then uses them to transfer, mint, burn, distribute, or refund.
+
     When in doubt, do NOT include a prompt in skip_prompts.
 """
 
@@ -1983,39 +1967,6 @@ GENERIC_LANG_HINT_BY_EXT = {
                 A function whose work grows with a collection that accumulates through normal user activity (especially nested iteration) can become uncallable.
                 Flag unbounded growth in work proportional to per-user state, not just attacker-controlled array growth.
     """,
-}
-
-# Provider routing per model — slugs verified from OpenRouter /api/v1/models/{id}/endpoints.
-# ignore: providers with observed structural failures or speed too low to complete within timeout.
-# order: preferred providers ranked by reliability + throughput from production run analysis.
-_PROVIDER_ROUTING: dict[str, dict] = {
-    THINKING_MODEL: {
-        # Current OpenRouter endpoints for qwen3-235b-a22b-thinking are Alibaba,
-        # DeepInfra, and Novita.  DeepInfra supports reasoning + response_format
-        # with a bounded max_tokens path, which is sufficient for Phase 0 and the
-        # verifier.  Novita does not advertise response_format for this model.
-        "ignore": ["novita"],
-        "order": ["alibaba", "deepinfra"],
-    },
-    PRIMARY_MODEL: {
-        # ambient: 25-46 tok/s; io-net: silent TCP failures; siliconflow: 17 tok/s; wandb: 32K hard cap
-        # atlas-cloud: ignores max_tokens → 82K natural stop @ 234 tok/s (352s) — viable with 500s timeout
-        # order removed — OR auto-balances across Parasail/AkashML/AtlasCloud/Alibaba/etc.
-        "ignore": ["deepinfra"],
-    },
-    JSON_MODEL: {
-        # deepinfra: 16K max_completion cap; novita: 32K cap at same price as atlas-cloud (131K cap) — strictly worse
-        # order removed — OR auto-balances across Parasail/AtlasCloud/Alibaba/Google Vertex
-        "ignore": ["deepinfra"],
-    },
-    ROUTER_MODEL: {
-        # deepinfra/novita/google-vertex/streamlake/alibaba: ≤32K max_completion — too low for agentic context buildup
-        # together: untested tool_calls behavior
-        # atlas-cloud: 14-30 tok/s and ~2x per-token cost vs wandb (Jun 2026 run) — last resort only
-        "ignore": ["deepinfra", "novita", "google-vertex", "streamlake", "alibaba", "together"],
-        "order": ["wandb", "friendli", "parasail", "atlas-cloud"],  # wandb 37-86 tok/s; atlas-cloud 14-30 tok/s (Run 2 observed)
-        "require_parameters": True,  # only route to providers that support tools + tool_choice
-    },
 }
 
 # Closed set of allowed vulnerability_type values — enforced in post-processing for both scan and agentic paths.
@@ -2145,6 +2096,12 @@ TIER4_ROLE_TARGETED_NAMES = frozenset({"PROMPT_ARITHMETIC", "PROMPT_DEX_INTEGRAT
 
 # Tier 4 Solidity-only: run only for Solidity-family files (regardless of risk level).
 TIER4_SOLIDITY_NAMES = frozenset({"PROMPT_EXTERNAL_CALL_LIFECYCLE", "PROMPT_UPGRADEABLE"})
+
+RECALL_PROTECTED_PROMPT_NAMES = frozenset({
+    "PROMPT_VALUE_DEPENDENCY",
+    "PROBE_HELPER_CALLER",
+    "PROMPT_REWARD_PRECISION",
+})
 
 # Role-based extra skips: prompts skipped only when the bug class is structurally
 # IMPOSSIBLE for the role — not merely unlikely.  False skips that drop a real bug
@@ -2846,15 +2803,12 @@ class BaselineRunner:
         else:
             payload["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget} if thinking_budget > 0 else {"type": "disabled"}
 
-        if used_model in _PROVIDER_ROUTING:
-            payload["provider"] = _PROVIDER_ROUTING[used_model]
-
         if tools is not None:
             payload["tools"] = tools
             # Prevent proxy from injecting response_format={"type":"json_object"} into tool-use
             # calls — JSON object mode is structurally incompatible with tool_call responses.
             # The proxy only injects if response_format is not already a dict, so an explicit
-            # "text" value blocks it without affecting OpenRouter's tool-call routing.
+            # "text" value blocks it without affecting tool-call responses.
             payload["response_format"] = {"type": "text"}
 
         if tool_choice is not None:
@@ -3707,8 +3661,7 @@ PROTOCOL MODEL CONTEXT
         _role_re = re.compile(
             r'(?i)(strateg|vault|router|registry|controller|manager|executor|pool'
             r'|staking|reward|validator|token|nft|bridge|oracle|lending|borrow'
-            r'|swap|liquidat|governor|treasury|escrow|dispatch|multicall|multi'
-            r'|inference)',
+            r'|swap|liquidat|governor|treasury|escrow|dispatch|multicall|multi)',
         )
         _base_re = re.compile(r'(?i)(base|core|main|impl|logic|abstract)')
         _iface_name_re = re.compile(r'^I[A-Z]')  # IVault, IRouter, IPool …
@@ -3769,6 +3722,25 @@ PROTOCOL MODEL CONTEXT
             for_count = text.count('for (') + text.count('for(')
             if for_count > 0 and (text.count('safeTransfer') + text.count('transferFrom')) > 0:
                 s += 4
+
+            # Batched value routing: parallel arrays, per-item recipient/account lookup,
+            # token movement, and per-id state updates are sharp accounting surfaces.
+            lower_text = text.lower()
+            array_param_count = len(re.findall(r"\[\]\s+(?:memory|calldata|storage)\s+\w+", lower_text))
+            token_move = any(k in lower_text for k in ("safetransferfrom", "transferfrom", "safetransfer(", ".transfer("))
+            external_recipient_lookup = bool(re.search(r"\.\w+\([^;]{0,120}\)\.\w+", lower_text))
+            per_id_state_update = bool(re.search(r"\[[^\]]*(?:id|key|account|user|recipient)[^\]]*\]\s*(?:\+\+|\+=|=)", lower_text))
+            length_zip_check = lower_text.count(".length") >= 3 and ("==" in lower_text or "!=" in lower_text)
+            if for_count and array_param_count >= 2 and token_move:
+                s += 8
+            if for_count and token_move and external_recipient_lookup:
+                s += 8
+            if for_count and per_id_state_update:
+                s += 4
+            if length_zip_check and for_count:
+                s += 3
+            if "nonreentrant" in lower_text and token_move and for_count:
+                s += 2
 
             # Rust/Stylus callable ABI boundary: #[entrypoint] is the top-level dispatch target.
             # Equivalent role to a delegatecall proxy in Solidity — needs cross-file ABI parity checks.
@@ -4240,6 +4212,8 @@ PROTOCOL MODEL CONTEXT
         skip_set = set(protocol_output.get("skip_prompts", []))
         skip_set |= _ROLE_EXTRA_SKIPS.get(role, frozenset())
         is_high_risk = protocol_output.get("is_high_risk", True)
+        if is_high_risk:
+            skip_set -= RECALL_PROTECTED_PROMPT_NAMES
         suffix = Path(relative_path).suffix.lower()
         is_solidity = suffix in SOLIDITY_FAMILY_SUFFIXES
         positive_includes = set(_ROLE_POSITIVE_INCLUDES.get(role, frozenset()))
@@ -4263,6 +4237,30 @@ PROTOCOL MODEL CONTEXT
         _BUSINESS_NOTES = {"vesting", "migrat", "rental", "lease",
                            "unlock", "schedule", "epoch",
                            "expir", "grace", "deprecat", "marketplace"}
+        path_low = relative_path.lower()
+        _signal_text = f"{path_low} {_notes}"
+        loop_tracker_hit = any(k in _signal_text for k in (
+            "previous id", "previous_id", "cached", "cached recipient",
+            "cached account", "cached address", "stale cache", "tracker",
+            "tracking key", "cursor", "last processed", "running", "loop",
+        ))
+        score_accounting_hit = any(k in _signal_text for k in (
+            "historical score", "past score", "base score", "uptime score",
+            "score accumulator", "reward weight", "score", "reward",
+            "distribution", "claimable", "validator",
+        ))
+        refund_amount_hit = any(k in _signal_text for k in (
+            "refund", "remainder", "remaining amount", "unused amount",
+            "actual amount", "consumed amount", "filled amount",
+            "requested amount", "amount used", "liquidity shortfall",
+            "liquidity insufficient", "insufficient liquidity", "partial fill",
+        ))
+        if loop_tracker_hit:
+            positive_includes |= {"PROBE_HELPER_CALLER", "PROMPT_VALUE_DEPENDENCY"}
+        if score_accounting_hit:
+            positive_includes |= {"PROMPT_REWARD_PRECISION", "PROMPT_VALUE_DEPENDENCY"}
+        if refund_amount_hit:
+            positive_includes |= {"PROBE_HELPER_CALLER", "PROMPT_DEX_INTEGRATION", "PROMPT_VALUE_DEPENDENCY"}
         if any(k in _notes for k in _DEX_NOTES):
             positive_includes |= {"PROMPT_DEX_INTEGRATION", "PROMPT_ARITHMETIC"}
         elif any(k in _notes for k in _MATH_NOTES):
@@ -4326,6 +4324,11 @@ PROTOCOL MODEL CONTEXT
             "Apply -0.20 ONLY when you are confident the finding is a false positive. When in doubt use 0.00.\n"
             "CRITICAL: never suppress a finding just because the bug class is common or because you haven't "
             "verified the full codebase. Err on the side of keeping findings.\n"
+            "Apply -0.20 only when your reason cites a concrete guard, require, modifier, invariant, "
+            "or state update in this file that blocks the exploit. For findings involving loop trackers, "
+            "cached recipients, refunds/remainders, consumed-vs-requested amounts, validator scores, "
+            "reward distribution, EIP-150 gas griefing, or nonce/credential burn, use 0.00 unless the "
+            "blocking code is explicit and local.\n"
             "Respond with ONLY valid JSON:\n"
             "{\"adjustments\": [{\"index\": <N>, \"delta\": <+0.10|0.00|-0.20>, \"reason\": \"<one line>\"}]}"
         )
@@ -4732,7 +4735,7 @@ PROTOCOL MODEL CONTEXT
             # Submission order: small files first, large files last.
             # Large files (factory/governance, 12-18K input tokens, 350-430s/call)
             # occupy all 12 thread pool workers continuously; small peripheral
-            # contracts (ContributionNft, ValidatorRegistry, AgentInference, 1-2K
+            # small peripheral contracts (roughly 1-2K
             # tokens, 30-60s/call) placed at deep queue positions never execute
             # before the collection deadline when submitted after large files.
             # Putting small files first ensures they start in the first worker wave
