@@ -39,6 +39,7 @@ class InferenceRequest(BaseModel):
     messages: list[dict[str, Any]]
     max_tokens: int = Field(default=4096)
     temperature: float = Field(default=0.2)
+    provider: dict[str, Any] | None = None
 
 
 # --- OpenAI-compatible response models ---
@@ -159,7 +160,7 @@ class ProxySummaryRow(BaseModel):
     cached_tokens: int = 0
     duration_ms_total: int = 0
     duration_ms_max: int = 0
-    status_codes: dict[str, int] = Field(default_factory=dict)
+    status_codes: dict[str, dict[str, int]] = Field(default_factory=dict)
 
     def to_summary_dict(self) -> dict[str, Any]:
         payload = self.model_dump()

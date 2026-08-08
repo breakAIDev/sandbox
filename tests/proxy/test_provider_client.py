@@ -4,6 +4,7 @@ import base_client
 from base_client import ProxyProviderError
 from validator.proxy.chutes_client import ChutesClient
 from validator.proxy.models import InferenceProvider, InferenceRequest, ProxyMetricsContext
+from validator.proxy.openrouter_client import OpenRouterClient
 
 
 class FakeResponse:
@@ -64,6 +65,11 @@ class FakeMetricsRecorder:
 
     def record_llm_attempt(self, ctx, attempt):
         self.attempts.append((ctx.model, attempt))
+
+
+def test_provider_clients_expose_auth_validation_defaults():
+    assert ChutesClient().default_model == "Qwen/Qwen3-32B-TEE"
+    assert OpenRouterClient().default_model == "openrouter/auto-beta"
 
 
 def test_provider_client_uses_response_model_for_metrics_when_available(monkeypatch):
@@ -143,10 +149,30 @@ def test_provider_client_logs_request_metadata_when_metrics_disabled(monkeypatch
     )
 
     assert any(
-        'Request from [A:agent-123|JR:unknown|Phase:execution] | provider="chutes" | model="requested-model"'
-        in message
+        'Request from [A:agent-123|JR:unknown|Phase:execution] | provider="chutes" | model="requested-model"' in message
         for message in fake_logger.infos
     )
+
+
+def test_provider_client_forwards_provider_request_options(monkeypatch):
+    captured_payload = {}
+
+    def fake_post(*args, **kwargs):
+        captured_payload.update(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("base_client.SESSION.post", fake_post)
+
+    OpenRouterClient().call(
+        InferenceRequest(
+            model="requested-model",
+            messages=[{"role": "user", "content": "hi"}],
+            provider={"sort": "throughput", "allow_fallbacks": False},
+        ),
+        InferenceProvider(api_key="sk-or-test"),
+    )
+
+    assert captured_payload["provider"] == {"sort": "throughput", "allow_fallbacks": False}
 
 
 def test_provider_client_flushes_retry_metrics_with_final_response_model(monkeypatch):
