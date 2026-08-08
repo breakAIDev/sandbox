@@ -39,9 +39,10 @@ app.add_typer(validator_app, name="validator")
 # -------------------------------------------------------
 # Helpers
 # -------------------------------------------------------
-def get_platform_client(wallet: str | None = None) -> PlatformClient:
+def get_platform_client(wallet: str | None = None, hotkey: str | None = None) -> PlatformClient:
     wallet_name = wallet or settings.wallet_name
-    return PlatformClient(settings.platform_url, wallet_name=wallet_name)
+    hotkey_name = hotkey or settings.hotkey_name
+    return PlatformClient(settings.platform_url, wallet_name=wallet_name, hotkey_name=hotkey_name)
 
 
 # -------------------------------------------------------
@@ -72,9 +73,10 @@ def miner_create(
     email: str = Argument(..., help="Email of the miner"),
     name: str | None = Argument(None, help="Optional name"),
     wallet: str | None = Option(None, help="Bittensor wallet name"),
+    hotkey: str | None = Option(None, help="Bittensor hotkey name"),
 ):
     """Create a miner user on the platform (registers with hotkey)."""
-    client = get_platform_client(wallet)
+    client = get_platform_client(wallet, hotkey)
     create_user(email=email, name=name, client=client, is_miner=True)
 
 
@@ -87,6 +89,7 @@ def miner_submit(
         help="Your execution API key (prefix must be cpk_ or sk-or-; will be sent to the platform)",
     ),
     wallet: str | None = Option(None, help="Bittensor wallet name"),
+    hotkey: str | None = Option(None, help="Bittensor hotkey name"),
 ):
     """Submit the miner agent code to the platform."""
     agent_path = Path("miner/agent.py")
@@ -98,7 +101,7 @@ def miner_submit(
     code_str = agent_path.read_text(encoding="utf-8")
     agent_code = AgentCode(code=code_str, execution_api_key=execution_api_key)
 
-    client = get_platform_client(wallet)
+    client = get_platform_client(wallet, hotkey)
     agent = client.submit_agent(agent_code)
     logger.info(f"Agent submitted: Agent ID {agent['id']} version {agent['version']}")
 
@@ -107,9 +110,10 @@ def miner_submit(
 def miner_cancel_agent(
     agent_id: int = Argument(..., help="Agent ID to cancel"),
     wallet: str | None = Option(None, help="Bittensor wallet name"),
+    hotkey: str | None = Option(None, help="Bittensor hotkey name"),
 ):
     """Cancel a submitted miner agent execution before evaluation."""
-    client = get_platform_client(wallet)
+    client = get_platform_client(wallet, hotkey)
     client.cancel_agent(agent_id)
     logger.info(f"Agent cancellation requested: Agent ID {agent_id}")
 
@@ -150,9 +154,10 @@ def validator_create(
     email: str = Argument(..., help="Email of the validator"),
     name: str | None = Argument(None, help="Optional name"),
     wallet: str | None = Option(None, help="Bittensor wallet name"),
+    hotkey: str | None = Option(None, help="Bittensor hotkey name"),
 ):
     """Create a validator account."""
-    client = get_platform_client(wallet)
+    client = get_platform_client(wallet, hotkey)
     create_user(email=email, name=name, client=client, is_miner=False)
 
 

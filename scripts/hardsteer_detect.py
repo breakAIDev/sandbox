@@ -23,13 +23,38 @@ CLAUDE_TIMEOUT_SECONDS = 15 * 60
 CLAUDE_READY_TIMEOUT_SECONDS = 45
 
 PROJECT_KEYS = [
-    "code4rena_superposition_2025_01",
-    "code4rena_lambowin_2025_02",
-    "cantina_minimal-delegation_2025_04",
-    "code4rena_forte-float128-solidity-library_2025_04",
-    "sherlock_axion_2025_01",
-    "code4rena_pump-science_2025_02",
-    "code4rena_virtuals-protocol_2025_08",
+    # 'cantina_generic-money_2025_11',                                                  # Solidity (2)
+    # 'cantina_minimal-delegation_2025_04',                                             # Solidity (2)
+    # 'cantina_smart-contract-audit-of-tn-contracts_2025_08',                           # Solidity (3)
+    # 'code4rena_bakerfi-invitational_2025_02',                                         # Solidity (7)
+    # 'code4rena_blackhole_2025_07',         
+    # 'code4rena_cabal-liquid-staking-token_2025_05',                                   # Move     (1)
+    # 'code4rena_coded-estate-invitational_2024_12',                                    # Rust     (9)
+    # 'code4rena_fenix-finance-invitational_2024_10',                                   # Solidity (1) 
+    # 'code4rena_forte-float128-solidity-library_2025_04',                              # Solidity (5) 
+    'code4rena_initia-move_2025_04',                                                  # Move     (4)
+    # 'code4rena_iq-ai_2025_03',                                                        # Solidity (1)
+    # 'code4rena_kinetiq_2025_07',                                                      # Solidity (3)
+    # 'code4rena_lambowin_2025_02',                                                     # Solidity (4)
+    # 'code4rena_liquid-ron_2025_03',                                                   # Solidity (1)
+    # 'code4rena_loopfi_2025_02',                                                       # Solidity (2)
+    'code4rena_mantra-dex_2025_03',                                                   # Rust     (12)
+    # 'code4rena_next-generation_2025_05',                                              # Solidity (1)
+    # 'code4rena_pump-science_2025_02',                                                 # Rust     (2)
+    # 'code4rena_secondswap_2025_02',                                                   # Solidity (3)
+    # 'code4rena_starknet-perpetual_2025_06',                                           # Cairo    (2)   
+    # 'code4rena_superposition_2025_01',                                                # Rust     (2)
+    'code4rena_virtuals-protocol_2025_08',                                            # Solidity (6)
+    # 'sherlock_20240920---final---boost-core-incentive-protocol-audit-report_2024_09', # Solidity (2)
+    # 'sherlock_axion_2025_01',                                                         # Solidity (4)
+    # 'sherlock_cork-protocol_2025_01',                                                 # Solidity (11)
+    # 'sherlock_crestal-network_2025_03',                                               # Solidity (1)
+    # 'sherlock_idle-finance_2024_12',                                                  # Solidity (2)
+    # 'sherlock_morph-l-2_2024_09',                                                     # Solidity (2)
+    # 'sherlock_oku_2024_12',                                                           # Solidity (8)
+    'sherlock_perennial_v2_update_3_2024_08',                                         # Solidity (7)
+    # 'sherlock_symmio_2025_03',                                                        # Solidity (1)
+    # 'sherlock_tally_2024_12',
 ]
 
 # Optional: set to a file path to save the rendered prompt for inspection.

@@ -1,9 +1,8 @@
 import base64
 import json
-import os
 import secrets
 import time
-from typing import Any, Literal
+from typing import Literal
 
 import requests
 from bittensor_wallet import Wallet
@@ -18,11 +17,12 @@ from validator.models.platform import (
     AgentCode,
     User,
     MockJobRun,
+    SubmittedAgentExecution,
 )
 
 
 class PlatformError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, details: Any | None = None):
+    def __init__(self, message: str, status_code: int | None = None, details=None):
         super().__init__(message)
         self.status_code = status_code
         self.details = details
@@ -34,10 +34,11 @@ class APIPlatformClient:
         base_url: str | None = None,
         timeout: int = 10,
         wallet_name: str | None = None,
+        hotkey_name: str | None = None,
     ):
         self.base_url = (base_url or settings.platform_url).rstrip("/")
         self.timeout = timeout
-        self.set_wallet(wallet_name)
+        self.set_wallet(wallet_name, hotkey_name)
 
         self.session = self.init_session()
 
@@ -56,9 +57,10 @@ class APIPlatformClient:
 
         return session
 
-    def set_wallet(self, wallet_name: str | None = None):
+    def set_wallet(self, wallet_name: str | None = None, hotkey_name: str | None = None):
         wallet_name = wallet_name or settings.wallet_name
-        wallet = Wallet(wallet_name, hotkey=settings.hotkey_name)
+        hotkey_name = hotkey_name or settings.hotkey_name
+        wallet = Wallet(name=wallet_name, hotkey=hotkey_name)
         self.hotkey = wallet.hotkey
 
     def _create_wallet_token(self, hotkey: str, expiry_minutes: int = 1) -> str:
@@ -84,9 +86,9 @@ class APIPlatformClient:
         endpoint: str,
         *,
         authenticate: bool = False,
-        params: dict[str, Any] | None = None,
-        json: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | list[Any] | None:
+        params: dict | None = None,
+        json: dict | None = None,
+    ):
         url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
 
         headers: dict[str, str] = {}
@@ -146,6 +148,15 @@ class APIPlatformClient:
         job_run = JobRun.model_validate(resp)
         return job_run
 
+    def get_next_scoring_job_run(self, validator_id: int):
+        endpoint = f"jobs/runs/validator/{validator_id}/evaluating"
+        resp = self._call_api("post", endpoint, authenticate=True)
+        if not resp:
+            return
+
+        job_run = JobRun.model_validate(resp)
+        return job_run
+
     def get_job_run_code(self, job_run_id: int):
         endpoint = f"jobs/runs/{job_run_id}/code"
         resp = self._call_api("get", endpoint)
@@ -161,7 +172,15 @@ class APIPlatformClient:
         resp = self._call_api("get", endpoint)
         return resp
 
-    def submit_agent_execution(self, agent_execution: AgentExecution) -> dict:
+    def get_job_run_executions(self, job_run_id: int) -> list[SubmittedAgentExecution]:
+        endpoint = f"jobs/runs/{job_run_id}/executions"
+        resp = self._call_api("get", endpoint, authenticate=True)
+        return [SubmittedAgentExecution.model_validate(item) for item in (resp or [])]
+
+    def submit_agent_execution(
+        self,
+        agent_execution: AgentExecution,
+    ) -> dict:
         endpoint = "agents/execution/"
         payload = agent_execution.model_dump(mode="json")
         resp = self._call_api("post", endpoint, json=payload, authenticate=True)
@@ -173,13 +192,18 @@ class APIPlatformClient:
         resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
 
-    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict[str, Any]) -> dict:
+    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict) -> dict:
         endpoint = f"jobs/runs/{job_run_id}/proxy-summary"
         resp = self._call_api("post", endpoint, json=payload, authenticate=True)
         return resp
 
     def start_job_run(self, job_run_id: int) -> dict:
         endpoint = f"jobs/runs/{job_run_id}/start"
+        resp = self._call_api("post", endpoint, authenticate=True)
+        return resp
+
+    def start_job_run_evaluation(self, job_run_id: int) -> dict:
+        endpoint = f"jobs/runs/{job_run_id}/evaluating"
         resp = self._call_api("post", endpoint, authenticate=True)
         return resp
 
@@ -224,7 +248,11 @@ class APIPlatformClient:
 
 class MockPlatformClient:
     def __init__(self, *args, **kwargs):
-        pass
+        self._current_job_run = None
+        self._evaluating_job_run = None
+        self._executions_by_job_run = {}
+        self._next_execution_id = 1
+        self._next_job_run_id = int(time.time())
 
     def __getattr__(self, name):
         def _method(*args, **kwargs):
@@ -232,42 +260,93 @@ class MockPlatformClient:
 
         return _method
 
-    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict[str, Any]) -> dict:
+    def submit_job_run_proxy_summary(self, job_run_id: int, payload: dict) -> dict:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return {"id": 1}
 
+    def submit_agent_execution(
+        self,
+        agent_execution: AgentExecution,
+    ) -> dict:
+        execution_id = self._next_execution_id
+        self._next_execution_id += 1
+
+        payload = agent_execution.model_dump(mode="json")
+        payload["id"] = execution_id
+        self._executions_by_job_run.setdefault(agent_execution.job_run_id, []).append(payload)
+
+        return {"id": execution_id}
+
+    def start_job_run_evaluation(self, job_run_id: int) -> dict:
+        self._evaluating_job_run = self._current_job_run
+        self._current_job_run = None
+        return {"id": job_run_id}
+
+    def get_next_scoring_job_run(self, validator_id: int):
+        job_run = self._evaluating_job_run
+        self._evaluating_job_run = None
+        return job_run
+
+    def get_job_run_executions(self, job_run_id: int) -> list[SubmittedAgentExecution]:
+        return [
+            SubmittedAgentExecution.model_validate(item)
+            for item in self._executions_by_job_run.get(job_run_id, [])
+        ]
+
     def get_job_run_agent(self, job_run_id: int):
         execution_api_key = settings.inference_api_key
-        default_project_keys = [
-            # "code4rena_secondswap_2025_02",
-            "code4rena_superposition_2025_01",
-            # "code4rena_loopfi_2025_02",
-            "code4rena_lambowin_2025_02",
-            # "code4rena_bakerfi-invitational_2025_02",
-            "cantina_minimal-delegation_2025_04",
-            # "code4rena_kinetiq_2025_07",
-            # "cantina_smart-contract-audit-of-tn-contracts_2025_08",
-            "code4rena_forte-float128-solidity-library_2025_04",
-            # "sherlock_perennial_v2_update_3_2024_08",
-            "sherlock_axion_2025_01",
-            # "sherlock_oku_2024_12",
-            "code4rena_pump-science_2025_02",
-            "code4rena_virtuals-protocol_2025_08",
-        ]
         agent = {
-            "project_keys": default_project_keys,
+            "project_keys": [
+                # 'cantina_generic-money_2025_11',                                                  # Solidity (2)
+                # 'cantina_minimal-delegation_2025_04',                                             # Solidity (2)
+                # 'cantina_smart-contract-audit-of-tn-contracts_2025_08',                           # Solidity (3)
+                # 'code4rena_bakerfi-invitational_2025_02',                                         # Solidity (7)
+                # 'code4rena_blackhole_2025_07',         
+                # 'code4rena_cabal-liquid-staking-token_2025_05',                                   # Move     (1)
+                # 'code4rena_coded-estate-invitational_2024_12',                                    # Rust     (9)
+                # 'code4rena_fenix-finance-invitational_2024_10',                                   # Solidity (1) 
+                # 'code4rena_forte-float128-solidity-library_2025_04',                              # Solidity (5) 
+                'code4rena_initia-move_2025_04',                                                  # Move     (4)
+                # 'code4rena_iq-ai_2025_03',                                                        # Solidity (1)
+                # 'code4rena_kinetiq_2025_07',                                                      # Solidity (3)
+                # 'code4rena_lambowin_2025_02',                                                     # Solidity (4)
+                # 'code4rena_liquid-ron_2025_03',                                                   # Solidity (1)
+                # 'code4rena_loopfi_2025_02',                                                       # Solidity (2)
+                'code4rena_mantra-dex_2025_03',                                                   # Rust     (12)
+                # 'code4rena_next-generation_2025_05',                                              # Solidity (1)
+                # 'code4rena_pump-science_2025_02',                                                 # Rust     (2)
+                # 'code4rena_secondswap_2025_02',                                                   # Solidity (3)
+                # 'code4rena_starknet-perpetual_2025_06',                                           # Cairo    (2)   
+                # 'code4rena_superposition_2025_01',                                                # Rust     (2)
+                'code4rena_virtuals-protocol_2025_08',                                            # Solidity (6)
+                # 'sherlock_20240920---final---boost-core-incentive-protocol-audit-report_2024_09', # Solidity (2)
+                # 'sherlock_axion_2025_01',                                                         # Solidity (4)
+                # 'sherlock_cork-protocol_2025_01',                                                 # Solidity (11)
+                # 'sherlock_crestal-network_2025_03',                                               # Solidity (1)
+                # 'sherlock_idle-finance_2024_12',                                                  # Solidity (2)
+                # 'sherlock_morph-l-2_2024_09',                                                     # Solidity (2)
+                # 'sherlock_oku_2024_12',                                                           # Solidity (8)
+                'sherlock_perennial_v2_update_3_2024_08',                                         # Solidity (7)
+                # 'sherlock_symmio_2025_03',                                                        # Solidity (1)
+                # 'sherlock_tally_2024_12',
+            ],
             "execution_api_key": execution_api_key,
             "eval_max_vulns": 100,
         }
         return agent
 
     def get_next_job_run(self, validator_id: int):
+        if self._current_job_run is not None:
+            return None
+
         job_run = MockJobRun(
-            id=int(time.time()),
+            id=self._next_job_run_id,
             job_id=1,
-            validator_id=1,
+            validator_id=validator_id,
             agent_id=1,
         )
+        self._next_job_run_id += 1
+        self._current_job_run = job_run
         return job_run
 
     def get_projects(self):

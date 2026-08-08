@@ -358,10 +358,10 @@
     "codebases": [
       {
         "codebase_id": "MANTRA DEX_b0bbf7",
-        "repo_url": "https://github.com/curvefi/curve-contract",
-        "commit": "b0bbf77f8f93c9c5f4e415bce9cd71f0cdee960e",
-        "tree_url": "https://github.com/curvefi/curve-contract/tree/b0bbf77f8f93c9c5f4e415bce9cd71f0cdee960e",
-        "tarball_url": "https://github.com/curvefi/curve-contract/archive/b0bbf77f8f93c9c5f4e415bce9cd71f0cdee960e.tar.gz"
+        "repo_url": "https://github.com/code-423n4/2024-11-mantra-dex",
+        "commit": "5ef933edd569c201d830c96acc377b7fd285ca35",
+        "tree_url": "https://github.com/code-423n4/2024-11-mantra-dex/tree/5ef933edd569c201d830c96acc377b7fd285ca35",
+        "tarball_url": "https://github.com/code-423n4/2024-11-mantra-dex/archive/5ef933edd569c201d830c96acc377b7fd285ca35.tar.gz"
       }
     ],
     "vulnerabilities": [
