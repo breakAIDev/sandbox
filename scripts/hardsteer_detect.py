@@ -28,15 +28,15 @@ PROJECT_KEYS = [
     # 'cantina_smart-contract-audit-of-tn-contracts_2025_08',                           # Solidity (3)
     # 'code4rena_bakerfi-invitational_2025_02',                                         # Solidity (7)
     # 'code4rena_blackhole_2025_07',         
-    # 'code4rena_cabal-liquid-staking-token_2025_05',                                   # Move     (1)
-    # 'code4rena_coded-estate-invitational_2024_12',                                    # Rust     (9)
+    'code4rena_cabal-liquid-staking-token_2025_05',                                   # Move     (1)
+    'code4rena_coded-estate-invitational_2024_12',                                    # Rust     (9)
     # 'code4rena_fenix-finance-invitational_2024_10',                                   # Solidity (1) 
     # 'code4rena_forte-float128-solidity-library_2025_04',                              # Solidity (5) 
     'code4rena_initia-move_2025_04',                                                  # Move     (4)
-    # 'code4rena_iq-ai_2025_03',                                                        # Solidity (1)
+    'code4rena_iq-ai_2025_03',                                                        # Solidity (1)
     # 'code4rena_kinetiq_2025_07',                                                      # Solidity (3)
     # 'code4rena_lambowin_2025_02',                                                     # Solidity (4)
-    # 'code4rena_liquid-ron_2025_03',                                                   # Solidity (1)
+    'code4rena_liquid-ron_2025_03',                                                   # Solidity (1)
     # 'code4rena_loopfi_2025_02',                                                       # Solidity (2)
     'code4rena_mantra-dex_2025_03',                                                   # Rust     (12)
     # 'code4rena_next-generation_2025_05',                                              # Solidity (1)
@@ -52,7 +52,7 @@ PROJECT_KEYS = [
     # 'sherlock_idle-finance_2024_12',                                                  # Solidity (2)
     # 'sherlock_morph-l-2_2024_09',                                                     # Solidity (2)
     # 'sherlock_oku_2024_12',                                                           # Solidity (8)
-    'sherlock_perennial_v2_update_3_2024_08',                                         # Solidity (7)
+    # 'sherlock_perennial_v2_update_3_2024_08',                                         # Solidity (7)
     # 'sherlock_symmio_2025_03',                                                        # Solidity (1)
     # 'sherlock_tally_2024_12',
 ]
